@@ -1,0 +1,18 @@
+[package]
+name = "om26_18"
+version = "0.1.0"
+edition = "2024"
+default-run = "om26_18"
+
+[dependencies]
+axum = { version = "0.8.9", default-features = false, features = ["http1", "json", "query", "tokio", "tracing"] }
+serde = { version = "1.0.229", features = ["derive"] }
+thiserror = "2.0.20"
+tokio = { version = "1.53.1", features = ["net", "process", "rt-multi-thread"] }
+tower-http = { version = "0.7.0", features = ["trace"] }
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
+utoipa = { version = "5.5.0", features = ["axum_extras", "url"] }
+utoipa-axum = "0.2.0"
+utoipa-swagger-ui = { version = "9.0.2", default-features = false, features = ["axum", "vendored"] }
+uuid = { version = "1.24.0", features = ["v7"] }

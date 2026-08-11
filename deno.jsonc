@@ -1,0 +1,17 @@
+{
+  "compilerOptions": {
+    "verbatimModuleSyntax": true
+  },
+  "fmt": {
+    "semiColons": false
+  },
+  "imports": {
+    "@std/async": "jsr:@std/async@^1.5.0",
+    "orval": "npm:orval@^8.24.0",
+    "textalive-app-api": "npm:textalive-app-api@^0.4.0"
+  },
+  "tasks": {
+    "bundle": "mkdir -p dist && deno bundle --minify --output dist/textalive.js src/services/textalive.ts",
+    "gen": "mkdir -p api && cargo run --bin export_schema && deno run --allow-env --allow-read --allow-run --allow-sys --allow-write npm:orval"
+  }
+}
