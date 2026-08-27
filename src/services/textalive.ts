@@ -1,6 +1,6 @@
 import { deadline } from "@std/async"
 import { Player } from "textalive-app-api"
-import type { Segment, SongData } from "../../api/om26_18.schemas.ts"
+import type { Beat, Segment, SongData } from "../../api/om26_18.schemas.ts"
 
 interface FetchSongDataParams {
   songUrl: string
@@ -30,6 +30,10 @@ const fetchSongData = async (
     throw new Error(`song not found: ${songUrl}`)
   }
 
+  const beats = player.data.songMap.beats.map((beat) => ({
+    startsAtMs: beat.startTime,
+    endsAtMs: beat.endTime,
+  } satisfies Beat)).sort((a, b) => a.startsAtMs - b.startsAtMs)
   const rawSegments = player.data.songMap.segments
   const segments = rawSegments.flatMap((rawSegment) => (
     rawSegment.segments.map((segment) => ({
@@ -45,11 +49,13 @@ const fetchSongData = async (
       artist: player.data.song.artist.name,
       title: player.data.song.name,
       durationMs: video.duration,
+      beats,
       segments,
     }
     : {
       type: "incomplete",
       durationMs: video.duration,
+      beats,
       segments,
     }
 }
