@@ -1,6 +1,11 @@
 import { deadline } from "@std/async"
 import { Player } from "textalive-app-api"
-import type { Beat, Segment, SongData } from "../../api/om26_18.schemas.ts"
+import type {
+  Beat,
+  Phrase,
+  Segment,
+  SongData,
+} from "../../api/om26_18.schemas.ts"
 
 interface FetchSongDataParams {
   songUrl: string
@@ -34,6 +39,11 @@ const fetchSongData = async (
     startsAtMs: beat.startTime,
     endsAtMs: beat.endTime,
   } satisfies Beat)).sort((a, b) => a.startsAtMs - b.startsAtMs)
+  const phrases = video.phrases.map((phrase) => ({
+    text: phrase.text,
+    startsAtMs: phrase.startTime,
+    endsAtMs: phrase.endTime,
+  } satisfies Phrase)).sort((a, b) => a.startsAtMs - b.startsAtMs)
   const rawSegments = player.data.songMap.segments
   const segments = rawSegments.flatMap((rawSegment) => (
     rawSegment.segments.map((segment) => ({
@@ -50,6 +60,7 @@ const fetchSongData = async (
       title: player.data.song.name,
       durationMs: video.duration,
       beats,
+      phrases,
       segments,
     }
     : {

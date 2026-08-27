@@ -14,6 +14,7 @@ pub struct CompleteSongData {
     artist: String,
     duration_ms: f32,
     beats: Vec<Beat>,
+    phrases: Vec<Phrase>,
     segments: Vec<Segment>,
     title: String,
 }
@@ -29,6 +30,14 @@ pub struct IncompleteSongData {
 #[derive(Deserialize, Serialize, ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct Beat {
+    starts_at_ms: f32,
+    ends_at_ms: f32,
+}
+
+#[derive(Deserialize, Serialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct Phrase {
+    text: String,
     starts_at_ms: f32,
     ends_at_ms: f32,
 }
