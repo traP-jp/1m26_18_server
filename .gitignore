@@ -1,4 +1,5 @@
-/api
+/api/*
+!/api/om26_18.schemas.ts
 /dist
 /target
 
