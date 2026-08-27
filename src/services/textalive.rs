@@ -3,6 +3,8 @@ use std::{env, fs, io};
 use tokio::process::Command;
 use uuid::Uuid;
 
+use crate::domain::model::SongData;
+
 #[derive(Debug, thiserror::Error)]
 pub enum TextAliveError {
     #[error(transparent)]
@@ -11,12 +13,15 @@ pub enum TextAliveError {
     #[error("fetching song data: {0}")]
     FetchSong(String),
 
+    #[error("parsing song data: {0}")]
+    Parse(#[from] serde_json::Error),
+
     #[error("temporary file path could not be converted to str")]
     TempFilePath,
 }
 
 #[tracing::instrument]
-pub async fn fetch_song_data(url: &str) -> Result<String, TextAliveError> {
+pub async fn fetch_song_data(url: &str) -> Result<SongData, TextAliveError> {
     let tmp_file_path = env::temp_dir().join(format!("{}.json", Uuid::now_v7()));
     let tmp_file_path_str = tmp_file_path
         .to_str()
@@ -39,8 +44,9 @@ pub async fn fetch_song_data(url: &str) -> Result<String, TextAliveError> {
     }
 
     let json_str = fs::read_to_string(tmp_file_path_str)?;
+    let song_data: SongData = serde_json::from_str(&json_str)?;
 
     fs::remove_file(tmp_file_path_str)?;
 
-    Ok(json_str)
+    Ok(song_data)
 }
