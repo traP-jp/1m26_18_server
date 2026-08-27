@@ -9,7 +9,7 @@ RUN --mount=type=bind,source=src,target=src \
     --mount=type=cache,target=/usr/src/app/target/ \
     --mount=type=cache,target=/usr/local/cargo/git/db \
     --mount=type=cache,target=/usr/local/cargo/registry/ \
-    cargo build --locked --release && cp target/release/app /tmp/app
+    cargo build --locked --release && cp target/release/om26_18 /tmp/app
 
 FROM gcr.io/distroless/cc-debian12:nonroot
 
