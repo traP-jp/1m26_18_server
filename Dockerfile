@@ -4,7 +4,6 @@ FROM rust:1.98.0-slim-trixie@sha256:fb4b2f1dc68c06f46618948b09d0ade147e6d2b11a65
 WORKDIR /usr/src/app
 
 RUN --mount=type=bind,source=src,target=src \
-    --mount=type=bind,source=migrations,target=migrations \
     --mount=type=bind,source=Cargo.toml,target=Cargo.toml \
     --mount=type=bind,source=Cargo.lock,target=Cargo.lock \
     --mount=type=cache,target=/usr/src/app/target/ \
