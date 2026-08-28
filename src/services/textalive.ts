@@ -2,9 +2,8 @@ import { deadline } from "@std/async"
 import { Player } from "textalive-app-api"
 import type {
   Beat,
-  Phrase,
+  FetchedSongData,
   Segment,
-  SongData,
 } from "../../api/om26_18.schemas.ts"
 
 interface FetchSongDataParams {
@@ -16,7 +15,7 @@ const TIMEOUT_MS = 5_000
 
 const fetchSongData = async (
   { songUrl, token }: FetchSongDataParams,
-): Promise<SongData> => {
+): Promise<FetchedSongData> => {
   const player = new Player({
     app: {
       token,
@@ -25,7 +24,6 @@ const fetchSongData = async (
 
   type Video = Awaited<ReturnType<typeof player.createFromSongUrl>>
 
-  // `createFromSongUrl` returns `null` if the song is not found
   const video: Video | null = await deadline(
     player.createFromSongUrl(songUrl),
     TIMEOUT_MS,
@@ -39,11 +37,6 @@ const fetchSongData = async (
     startsAtMs: beat.startTime,
     endsAtMs: beat.endTime,
   } satisfies Beat)).sort((a, b) => a.startsAtMs - b.startsAtMs)
-  const phrases = video.phrases.map((phrase) => ({
-    text: phrase.text,
-    startsAtMs: phrase.startTime,
-    endsAtMs: phrase.endTime,
-  } satisfies Phrase)).sort((a, b) => a.startsAtMs - b.startsAtMs)
   const rawSegments = player.data.songMap.segments
   const segments = rawSegments.flatMap((rawSegment) => (
     rawSegment.segments.map((segment) => ({
@@ -53,8 +46,15 @@ const fetchSongData = async (
     } satisfies Segment))
   )).sort((a, b) => a.startsAtMs - b.startsAtMs)
 
-  return player.data.song.artist.name && player.data.song.name
-    ? {
+  const isComplete = !!(player.data.song.artist.name && player.data.song.name)
+
+  if (isComplete) {
+    const phrases = video.phrases.map((phrase) => ({
+      text: phrase.text,
+      startsAtMs: phrase.startTime,
+      endsAtMs: phrase.endTime,
+    })).sort((a, b) => a.startsAtMs - b.startsAtMs)
+    return {
       type: "complete",
       artist: player.data.song.artist.name,
       title: player.data.song.name,
@@ -63,12 +63,14 @@ const fetchSongData = async (
       phrases,
       segments,
     }
-    : {
-      type: "incomplete",
-      durationMs: video.duration,
-      beats,
-      segments,
-    }
+  }
+
+  return {
+    type: "incomplete",
+    durationMs: video.duration,
+    beats,
+    segments,
+  }
 }
 
 if (import.meta.main) {
@@ -96,7 +98,6 @@ if (import.meta.main) {
   try {
     const data = await fetchSongData({ songUrl, token })
 
-    console.log(data)
     Deno.writeTextFileSync(tmpFilePath, JSON.stringify(data))
   } catch (err) {
     console.error(err)

@@ -33,22 +33,14 @@ export interface CompleteSongData {
 export interface CreateSongRequest {
   artist: string
   lyrics: string
+  lyricsJsonUrl: string
+  songUrl: string
   title: string
-  url: string
-}
-
-export interface FetchedPhrase {
-  /** @minimum 0 */
-  charCount: number
-  endsAtMs: number
-  startsAtMs: number
-  text: string
 }
 
 export interface FetchedIncompleteSongData {
   beats: Beat[]
   durationMs: number
-  phrases: FetchedPhrase[]
   segments: Segment[]
 }
 
@@ -74,7 +66,7 @@ export type SongData =
     type: "incomplete"
   }
 
-export type GetSongByPublicUrlParams = {
+export type GetSongByUrlParams = {
   /**
    * [TextAlive](https://textalive.jp/songs)に登録されている曲のURL
    */

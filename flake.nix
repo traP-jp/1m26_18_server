@@ -21,6 +21,7 @@
         devShells.default = pkgs.mkShell {
           packages = [
             pkgs.deno
+            pkgs.sqlx-cli
             rustToolchain
           ];
           RUST_SRC_PATH = "${rustToolchain}/lib/rustlib/src/rust/library";

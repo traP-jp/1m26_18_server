@@ -1,0 +1,17 @@
+CREATE TABLE IF NOT EXISTS songs (
+    url VARCHAR(512) NOT NULL PRIMARY KEY,
+    title VARCHAR(255) NOT NULL,
+    artist VARCHAR(255) NOT NULL,
+    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+CREATE TABLE IF NOT EXISTS phrases (
+    id BIGINT NOT NULL AUTO_INCREMENT PRIMARY KEY,
+    song_url VARCHAR(512) NOT NULL,
+    idx INT NOT NULL,
+    text VARCHAR(512) NOT NULL,
+    starts_at_ms FLOAT NOT NULL,
+    ends_at_ms FLOAT NOT NULL,
+    CONSTRAINT fk_phrases_song FOREIGN KEY (song_url) REFERENCES songs(url) ON DELETE CASCADE,
+    UNIQUE KEY uq_song_idx (song_url, idx)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;

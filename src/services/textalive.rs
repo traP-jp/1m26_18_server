@@ -3,7 +3,7 @@ use std::{env, fs, io};
 use tokio::process::Command;
 use uuid::Uuid;
 
-use crate::domain::model::SongData;
+use crate::domain::model::FetchedSongData;
 
 #[derive(Debug, thiserror::Error)]
 pub enum TextAliveError {
@@ -21,7 +21,7 @@ pub enum TextAliveError {
 }
 
 #[tracing::instrument]
-pub async fn fetch_song_data(url: &str) -> Result<SongData, TextAliveError> {
+pub async fn fetch_song_data(url: &str) -> Result<FetchedSongData, TextAliveError> {
     let tmp_file_path = env::temp_dir().join(format!("{}.json", Uuid::now_v7()));
     let tmp_file_path_str = tmp_file_path
         .to_str()
@@ -44,7 +44,7 @@ pub async fn fetch_song_data(url: &str) -> Result<SongData, TextAliveError> {
     }
 
     let json_str = fs::read_to_string(tmp_file_path_str)?;
-    let song_data: SongData = serde_json::from_str(&json_str)?;
+    let song_data: FetchedSongData = serde_json::from_str(&json_str)?;
 
     fs::remove_file(tmp_file_path_str)?;
 

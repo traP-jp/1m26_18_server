@@ -1,0 +1,44 @@
+{
+  "db_name": "MySQL",
+  "query": "SELECT text, starts_at_ms, ends_at_ms FROM phrases WHERE song_url = ? ORDER BY idx ASC",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "text",
+        "type_info": {
+          "type": "VarString",
+          "flags": "NOT_NULL | NO_DEFAULT_VALUE",
+          "max_size": 2048
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "starts_at_ms",
+        "type_info": {
+          "type": "Float",
+          "flags": "NOT_NULL | NO_DEFAULT_VALUE",
+          "max_size": 12
+        }
+      },
+      {
+        "ordinal": 2,
+        "name": "ends_at_ms",
+        "type_info": {
+          "type": "Float",
+          "flags": "NOT_NULL | NO_DEFAULT_VALUE",
+          "max_size": 12
+        }
+      }
+    ],
+    "parameters": {
+      "Right": 1
+    },
+    "nullable": [
+      false,
+      false,
+      false
+    ]
+  },
+  "hash": "02a0ae95ceb44c8f9dbf9124a4bc5e017806bc7557f262405cacf6226c0746e5"
+}

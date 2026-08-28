@@ -1,0 +1,12 @@
+{
+  "db_name": "MySQL",
+  "query": "INSERT INTO songs (url, title, artist) VALUES (?, ?, ?)",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 3
+    },
+    "nullable": []
+  },
+  "hash": "22f0722b9910f8eb700163c5475a75226801b5441bbbbeef2022d9a5115e1cd7"
+}
