@@ -5,7 +5,7 @@ WORKDIR /usr/src/app
 
 ENV SQLX_OFFLINE=true
 
-RUN --mount=type=cache,source=.sqlx,target=.sqlx \
+RUN --mount=type=bind,source=.sqlx,target=.sqlx \
     --mount=type=bind,source=src,target=src \
     --mount=type=bind,source=Cargo.toml,target=Cargo.toml \
     --mount=type=bind,source=Cargo.lock,target=Cargo.lock \
