@@ -4,6 +4,7 @@ use std::io::Result;
 
 use axum::Router;
 use tokio::net::TcpListener;
+use tower_http::cors::CorsLayer;
 use tower_http::trace::TraceLayer;
 use utoipa::openapi::{ComponentsBuilder, Info, OpenApi, OpenApiBuilder, Server};
 use utoipa_axum::router::OpenApiRouter;
@@ -47,6 +48,7 @@ pub async fn serve(state: AppState) -> Result<()> {
     let router = Router::new()
         .nest(API_ROOT, router)
         .merge(SwaggerUi::new("/docs/swagger-ui").url("/docs/openapi.json", openapi))
+        .layer(CorsLayer::permissive())
         .layer(TraceLayer::new_for_http())
         .with_state(state);
     let listener = TcpListener::bind("0.0.0.0:8080").await?;
