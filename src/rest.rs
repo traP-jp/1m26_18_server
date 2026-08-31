@@ -1,3 +1,4 @@
+pub mod room;
 pub mod song;
 
 use std::io::Result;
@@ -11,11 +12,13 @@ use utoipa_axum::router::OpenApiRouter;
 use utoipa_swagger_ui::SwaggerUi;
 
 use crate::domain::model::{FetchedIncompleteSongData, FetchedSongData};
+use crate::services::room::RoomService;
 use crate::services::song::SongService;
 
 #[derive(Clone)]
 pub struct AppState {
     pub song_service: SongService,
+    pub room_service: RoomService,
 }
 
 const API_ROOT: &str = "/api/v1";
@@ -40,6 +43,7 @@ pub fn setup_openapi_routes() -> (Router<AppState>, OpenApi) {
             song::get_song_by_url,
             song::create_song
         ))
+        .routes(utoipa_axum::routes!(room::create_room))
         .split_for_parts()
 }
 

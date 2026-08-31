@@ -1211,6 +1211,8 @@ name = "om26_18"
 version = "0.1.0"
 dependencies = [
  "axum",
+ "parking_lot",
+ "rand 0.10.2",
  "reqwest",
  "serde",
  "serde_json",

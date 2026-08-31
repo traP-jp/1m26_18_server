@@ -1,5 +1,8 @@
 use om26_18::{
-    repository::song::SongRepository, rest, rest::AppState, services::song::SongService,
+    repository::{room::RoomRepository, song::SongRepository},
+    rest,
+    rest::AppState,
+    services::{room::RoomService, song::SongService},
 };
 use sqlx::{migrate::MigrateError, mysql::MySqlPoolOptions};
 use tracing_subscriber::EnvFilter;
@@ -32,7 +35,12 @@ async fn main() -> Result<(), AppError> {
 
     let repo = SongRepository::new(pool);
     let song_service = SongService::new(repo);
-    let state = AppState { song_service };
+    let room_repo = RoomRepository::new();
+    let room_service = RoomService::new(room_repo, song_service.clone());
+    let state = AppState {
+        song_service,
+        room_service,
+    };
 
     rest::serve(state).await?;
 
