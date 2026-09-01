@@ -74,18 +74,18 @@ impl RoomRepository {
         connection: wtransport::Connection,
     ) -> Result<(), InsertHostError> {
         let mut map = self.inner.write();
-        match map.get(room_id) {
-            Some(Room::Waiting(waiting)) => {
-                if waiting.host_token() != token {
-                    return Err(InsertHostError::InvalidToken);
-                }
+        let waiting = match map.remove(room_id) {
+            Some(Room::Waiting(waiting)) => waiting,
+            Some(room @ Room::HostJoined(_)) => {
+                map.insert(room_id.to_string(), room);
+                return Err(InsertHostError::HostAlreadyJoined);
             }
-            Some(Room::HostJoined(_)) => return Err(InsertHostError::HostAlreadyJoined),
             None => return Err(InsertHostError::RoomNotFound),
-        }
-        let Room::Waiting(waiting) = map.remove(room_id).unwrap() else {
-            unreachable!("variant checked above")
         };
+        if waiting.host_token() != token {
+            map.insert(room_id.to_string(), Room::Waiting(waiting));
+            return Err(InsertHostError::InvalidToken);
+        }
         map.insert(
             room_id.to_string(),
             Room::HostJoined(waiting.join_host(Host::new(host_id, connection))),

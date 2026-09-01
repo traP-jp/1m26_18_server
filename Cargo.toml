@@ -53,3 +53,5 @@ wtransport = "0.7.1"
 
 [lints.clippy]
 absolute_paths = "warn"
+expect_used = "deny"
+unwrap_used = "deny"

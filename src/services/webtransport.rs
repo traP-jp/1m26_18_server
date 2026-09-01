@@ -20,6 +20,8 @@ use crate::{
 
 static ROOM_ROUTER: LazyLock<matchit::Router<()>> = LazyLock::new(|| {
     let mut router = matchit::Router::new();
+    // The route is statically valid; registration cannot fail.
+    #[allow(clippy::expect_used)]
     router
         .insert("/rooms/{room_id}", ())
         .expect("valid route: /rooms/{room_id}");
@@ -237,9 +239,9 @@ async fn handle_bi_stream(
         },
     };
 
-    send_message(&mut send_stream, &response).await?;
+    let payload = send_message(&mut send_stream, &response).await?;
 
-    info!(participant_id = %participant_id, response = %String::from_utf8_lossy(&serde_json::to_vec(&response).unwrap()), "responded to participant");
+    info!(participant_id = %participant_id, response = %payload, "responded to participant");
 
     Ok(())
 }
@@ -247,11 +249,11 @@ async fn handle_bi_stream(
 async fn send_message(
     send_stream: &mut wtransport::SendStream,
     msg: &ServerMessage,
-) -> Result<(), WebTransportError> {
-    let payload = serde_json::to_vec(msg).unwrap();
-    send_stream.write_all(&payload).await?;
+) -> Result<String, WebTransportError> {
+    let payload = serde_json::to_string(msg)?;
+    send_stream.write_all(payload.as_bytes()).await?;
     send_stream.finish().await?;
-    Ok(())
+    Ok(payload)
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -262,6 +264,8 @@ pub enum WebTransportError {
     Io(#[from] io::Error),
     #[error("stream write error: {0}")]
     StreamWrite(#[from] StreamWriteError),
+    #[error("serialization error: {0}")]
+    Serialization(#[from] serde_json::Error),
 }
 
 #[cfg(test)]
@@ -288,13 +292,14 @@ mod tests {
             "segments": [{"isChorus": false, "startsAtMs": 0.0, "endsAtMs": 1000.0}],
             "title": "title"
         }))
-        .unwrap()
+        .expect("valid dummy song JSON")
     }
 
     fn setup_room_service(room_id: &str) -> (RoomRepository, RoomService) {
         let room_repo = RoomRepository::new();
         let pool =
-            sqlx::MySqlPool::connect_lazy("mysql://root:password@127.0.0.1:3306/database").unwrap();
+            sqlx::MySqlPool::connect_lazy("mysql://root:password@127.0.0.1:3306/database")
+                .expect("lazy pool");
         let song_repo = SongRepository::new(pool);
         let song_service = SongService::new(song_repo);
         let room_service = RoomService::new(room_repo.clone(), song_service);
@@ -336,7 +341,8 @@ mod tests {
             .expect("open_bi")
             .await
             .expect("open_bi2");
-        let join_msg = serde_json::to_vec(&ClientMessage::Join).unwrap();
+        let join_msg =
+            serde_json::to_vec(&ClientMessage::Join).expect("serialize join message");
         send.write_all(&join_msg).await.expect("write");
         send.finish().await.expect("finish");
 
@@ -350,24 +356,24 @@ mod tests {
 
     #[tokio::test]
     async fn test_parse_room_path() {
-        let route = parse_room_path("/rooms/1234").unwrap();
+        let route = parse_room_path("/rooms/1234").expect("valid route");
         assert_eq!(route.room_id, "1234");
         assert_eq!(route.host_token, None);
-        let route = parse_room_path("/rooms/abcd").unwrap();
+        let route = parse_room_path("/rooms/abcd").expect("valid route");
         assert_eq!(route.room_id, "abcd");
         assert_eq!(route.host_token, None);
-        let route = parse_room_path("/rooms/1234?foo=bar").unwrap();
+        let route = parse_room_path("/rooms/1234?foo=bar").expect("valid route");
         assert_eq!(route.room_id, "1234");
         assert_eq!(route.host_token, None);
-        let route = parse_room_path("/rooms/1234?hostToken=tok").unwrap();
+        let route = parse_room_path("/rooms/1234?hostToken=tok").expect("valid route");
         assert_eq!(route.room_id, "1234");
         assert_eq!(route.host_token.as_deref(), Some("tok"));
-        let route = parse_room_path("/rooms/1234?foo=bar&hostToken=tok").unwrap();
+        let route = parse_room_path("/rooms/1234?foo=bar&hostToken=tok").expect("valid route");
         assert_eq!(route.host_token.as_deref(), Some("tok"));
         // percent-decoding via serde_urlencoded/form_urlencoded
-        let route = parse_room_path("/rooms/1234?hostToken=a%20b").unwrap();
+        let route = parse_room_path("/rooms/1234?hostToken=a%20b").expect("valid route");
         assert_eq!(route.host_token.as_deref(), Some("a b"));
-        let route = parse_room_path("/rooms/1234?hostToken=a%2Fb").unwrap();
+        let route = parse_room_path("/rooms/1234?hostToken=a%2Fb").expect("valid route");
         assert_eq!(route.host_token.as_deref(), Some("a/b"));
         assert!(parse_room_path("/rooms/").is_none());
         assert!(parse_room_path("/rooms").is_none());
@@ -403,7 +409,8 @@ mod tests {
     async fn test_webtransport_nonexistent_room_closed() {
         let room_repo = RoomRepository::new();
         let pool =
-            sqlx::MySqlPool::connect_lazy("mysql://root:password@127.0.0.1:3306/database").unwrap();
+            sqlx::MySqlPool::connect_lazy("mysql://root:password@127.0.0.1:3306/database")
+                .expect("lazy pool");
         let song_repo = SongRepository::new(pool);
         let song_service = SongService::new(song_repo);
         let room_service = RoomService::new(room_repo, song_service);
