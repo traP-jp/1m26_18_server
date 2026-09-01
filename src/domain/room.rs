@@ -113,6 +113,7 @@ pub struct CreateRoomResponse {
 #[derive(Debug)]
 pub enum ClientMessage {
     Join,
+    TimeSyncRequest,
 }
 
 /// Message sent from the server to the client over WebTransport.
@@ -121,5 +122,6 @@ pub enum ClientMessage {
 #[derive(Debug)]
 pub enum ServerMessage {
     Joined { participant_id: Uuid },
+    TimeSyncResponse { t1: u64, t2: u64 },
     Error { message: String },
 }

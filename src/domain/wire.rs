@@ -24,11 +24,13 @@
 //!
 //! Currently defined events:
 //!
-//! | ID   | Direction | Event   | Payload                       |
-//! |------|-----------|---------|-------------------------------|
-//! | 0x01 | C -> S    | Join    | empty                         |
-//! | 0x81 | S -> C    | Joined  | 16-byte UUID (participant id) |
-//! | 0x82 | S -> C    | Error   | u16 length + UTF-8 message    |
+//! | ID   | Direction | Event           | Payload                       |
+//! |------|-----------|-----------------|-------------------------------|
+//! | 0x01 | C -> S    | Join            | empty                         |
+//! | 0x02 | C -> S    | TimeSyncRequest | empty                         |
+//! | 0x81 | S -> C    | Joined          | 16-byte UUID (participant id) |
+//! | 0x83 | S -> C    | TimeSyncResponse| u64 t1 + u64 t2 (unix µs)     |
+//! | 0x82 | S -> C    | Error           | u16 length + UTF-8 message    |
 
 use std::str::from_utf8;
 
@@ -38,8 +40,12 @@ use crate::domain::room::{ClientMessage, ServerMessage};
 
 /// Event ID of [`ClientMessage::Join`].
 pub const EVENT_JOIN: u8 = 0x01;
+/// Event ID of [`ClientMessage::TimeSyncRequest`].
+pub const EVENT_TIME_SYNC_REQUEST: u8 = 0x02;
 /// Event ID of [`ServerMessage::Joined`].
 pub const EVENT_JOINED: u8 = 0x81;
+/// Event ID of [`ServerMessage::TimeSyncResponse`].
+pub const EVENT_TIME_SYNC_RESPONSE: u8 = 0x83;
 /// Event ID of [`ServerMessage::Error`].
 pub const EVENT_ERROR: u8 = 0x82;
 
@@ -118,6 +124,22 @@ impl Decode for u16 {
     }
 }
 
+impl Encode for u64 {
+    fn encode(&self, buf: &mut Vec<u8>) -> Result<(), EncodeError> {
+        buf.extend_from_slice(&self.to_be_bytes());
+        Ok(())
+    }
+}
+
+impl Decode for u64 {
+    fn decode(buf: &mut &[u8]) -> Result<Self, DecodeError> {
+        let bytes = take(buf, 8)?;
+        let mut array = [0u8; 8];
+        array.copy_from_slice(bytes);
+        Ok(u64::from_be_bytes(array))
+    }
+}
+
 impl Encode for str {
     fn encode(&self, buf: &mut Vec<u8>) -> Result<(), EncodeError> {
         let len = self.len();
@@ -164,6 +186,7 @@ impl Encode for ClientMessage {
     fn encode(&self, buf: &mut Vec<u8>) -> Result<(), EncodeError> {
         match self {
             ClientMessage::Join => EVENT_JOIN.encode(buf),
+            ClientMessage::TimeSyncRequest => EVENT_TIME_SYNC_REQUEST.encode(buf),
         }
     }
 }
@@ -172,6 +195,7 @@ impl Decode for ClientMessage {
     fn decode(buf: &mut &[u8]) -> Result<Self, DecodeError> {
         match u8::decode(buf)? {
             EVENT_JOIN => Ok(ClientMessage::Join),
+            EVENT_TIME_SYNC_REQUEST => Ok(ClientMessage::TimeSyncRequest),
             id => Err(DecodeError::UnknownEventId(id)),
         }
     }
@@ -183,6 +207,11 @@ impl Encode for ServerMessage {
             ServerMessage::Joined { participant_id } => {
                 EVENT_JOINED.encode(buf)?;
                 participant_id.encode(buf)
+            }
+            ServerMessage::TimeSyncResponse { t1, t2 } => {
+                EVENT_TIME_SYNC_RESPONSE.encode(buf)?;
+                t1.encode(buf)?;
+                t2.encode(buf)
             }
             ServerMessage::Error { message } => {
                 EVENT_ERROR.encode(buf)?;
@@ -197,6 +226,10 @@ impl Decode for ServerMessage {
         match u8::decode(buf)? {
             EVENT_JOINED => Ok(ServerMessage::Joined {
                 participant_id: Uuid::decode(buf)?,
+            }),
+            EVENT_TIME_SYNC_RESPONSE => Ok(ServerMessage::TimeSyncResponse {
+                t1: u64::decode(buf)?,
+                t2: u64::decode(buf)?,
             }),
             EVENT_ERROR => Ok(ServerMessage::Error {
                 message: String::decode(buf)?,
@@ -252,6 +285,35 @@ mod tests {
     }
 
     #[test]
+    fn time_sync_request_roundtrip() {
+        let mut buf = Vec::new();
+        ClientMessage::TimeSyncRequest
+            .encode(&mut buf)
+            .expect("encode time sync request");
+        assert_eq!(buf, [EVENT_TIME_SYNC_REQUEST]);
+        assert!(matches!(
+            decode_exact::<ClientMessage>(&buf).expect("decode time sync request"),
+            ClientMessage::TimeSyncRequest
+        ));
+    }
+
+    #[test]
+    fn time_sync_response_roundtrip() {
+        let mut buf = Vec::new();
+        ServerMessage::TimeSyncResponse { t1: 1000, t2: 2000 }
+            .encode(&mut buf)
+            .expect("encode time sync response");
+        assert_eq!(buf[0], EVENT_TIME_SYNC_RESPONSE);
+        assert_eq!(buf.len(), 17);
+        match decode_exact::<ServerMessage>(&buf).expect("decode time sync response") {
+            ServerMessage::TimeSyncResponse { t1, t2 } => {
+                assert_eq!((t1, t2), (1000, 2000));
+            }
+            other => panic!("unexpected message: {other:?}"),
+        }
+    }
+
+    #[test]
     fn unknown_event_id() {
         assert!(matches!(
             decode_exact::<ClientMessage>(&[0x7F]),
@@ -299,6 +361,21 @@ mod tests {
         ));
         buf = vec![EVENT_JOINED];
         buf.extend_from_slice(&[0u8; 15]);
+        assert!(matches!(
+            decode_exact::<ServerMessage>(&buf),
+            Err(DecodeError::UnexpectedEof)
+        ));
+        buf = vec![
+            EVENT_TIME_SYNC_RESPONSE,
+            0x00,
+            0x00,
+            0x00,
+            0x00,
+            0x00,
+            0x00,
+            0x00,
+            0x01,
+        ];
         assert!(matches!(
             decode_exact::<ServerMessage>(&buf),
             Err(DecodeError::UnexpectedEof)

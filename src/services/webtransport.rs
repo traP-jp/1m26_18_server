@@ -1,4 +1,9 @@
-use std::{io, net::SocketAddr, sync::LazyLock, time::Duration};
+use std::{
+    io,
+    net::SocketAddr,
+    sync::LazyLock,
+    time::{Duration, SystemTime, UNIX_EPOCH},
+};
 
 use axum::extract::Query;
 use serde::Deserialize;
@@ -146,7 +151,8 @@ impl WebTransportServer {
 
             info!(room_id = %room_id, host_id = %host_id, "host joined room");
 
-            let _ = connection.closed().await;
+            handle_connection_streams(&room_id, host_id, &connection).await;
+
             info!(room_id = %room_id, host_id = %host_id, "host disconnected, removing room");
             room_service.remove_room(&room_id);
             return;
@@ -165,23 +171,33 @@ impl WebTransportServer {
 
         info!(room_id = %room_id, participant_id = %participant_id, "participant joined");
 
-        loop {
-            let (send_stream, recv_stream) = match connection.accept_bi().await {
-                Ok(streams) => streams,
-                Err(e) => {
-                    info!(room_id = %room_id, participant_id = %participant_id, error = %e, "connection closed");
-                    break;
-                }
-            };
-
-            tokio::spawn(async move {
-                if let Err(e) = handle_bi_stream(send_stream, recv_stream, &participant_id).await {
-                    warn!(error = %e, "failed to handle bi stream");
-                }
-            });
-        }
+        handle_connection_streams(&room_id, participant_id, &connection).await;
 
         room_service.leave_room(&room_id, &participant_id);
+    }
+}
+
+/// Accepts bidirectional streams until the connection closes, handling each
+/// request in its own task. Shared by participants and the host.
+async fn handle_connection_streams(
+    room_id: &str,
+    client_id: Uuid,
+    connection: &wtransport::Connection,
+) {
+    loop {
+        let (send_stream, recv_stream) = match connection.accept_bi().await {
+            Ok(streams) => streams,
+            Err(e) => {
+                info!(room_id = %room_id, client_id = %client_id, error = %e, "connection closed");
+                break;
+            }
+        };
+
+        tokio::spawn(async move {
+            if let Err(e) = handle_bi_stream(send_stream, recv_stream, client_id).await {
+                warn!(error = %e, "failed to handle bi stream");
+            }
+        });
     }
 }
 
@@ -213,7 +229,7 @@ fn parse_room_path(path: &str) -> Option<RoomRoute> {
 async fn handle_bi_stream(
     mut send_stream: wtransport::SendStream,
     mut recv_stream: wtransport::RecvStream,
-    participant_id: &Uuid,
+    client_id: Uuid,
 ) -> Result<(), WebTransportError> {
     // Read the client request (capped at 8 KiB; excess is truncated).
     let mut buf = Vec::new();
@@ -226,7 +242,7 @@ async fn handle_bi_stream(
     if buf.is_empty() {
         // Treat an empty request as a join (browser implementations differ).
         let response = ServerMessage::Joined {
-            participant_id: *participant_id,
+            participant_id: client_id,
         };
         send_message(&mut send_stream, &response).await?;
         return Ok(());
@@ -234,13 +250,20 @@ async fn handle_bi_stream(
 
     let response = match decode_exact::<ClientMessage>(&buf) {
         Ok(ClientMessage::Join) => Some(ServerMessage::Joined {
-            participant_id: *participant_id,
+            participant_id: client_id,
         }),
+        Ok(ClientMessage::TimeSyncRequest) => {
+            // Stateless NTP-like exchange: t1 is taken as soon as the request
+            // has been received and t2 right before the response is written.
+            let t1 = unix_micros();
+            let t2 = unix_micros();
+            Some(ServerMessage::TimeSyncResponse { t1, t2 })
+        }
         Err(e) => {
             // Unknown event IDs and malformed messages are ignored silently
             // (no response is written) so that new client events can be
             // rolled out independently.
-            warn!(participant_id = %participant_id, error = %e, "ignoring undecodable client message");
+            warn!(participant_id = %client_id, error = %e, "ignoring undecodable client message");
             None
         }
     };
@@ -249,7 +272,7 @@ async fn handle_bi_stream(
         Some(response) => {
             send_message(&mut send_stream, &response).await?;
             info!(
-                participant_id = %participant_id,
+                participant_id = %client_id,
                 response = ?response,
                 "responded to participant"
             );
@@ -258,6 +281,14 @@ async fn handle_bi_stream(
     }
 
     Ok(())
+}
+
+/// Current wall-clock time in microseconds since the Unix epoch.
+fn unix_micros() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|elapsed| u64::try_from(elapsed.as_micros()).unwrap_or(u64::MAX))
+        .unwrap_or(0)
 }
 
 async fn send_message(
@@ -366,6 +397,7 @@ mod tests {
         recv.read_to_end(&mut buf).await.expect("read_to_end");
         match decode_exact::<ServerMessage>(&buf).expect("valid server message") {
             ServerMessage::Joined { participant_id } => participant_id,
+            ServerMessage::TimeSyncResponse { .. } => panic!("unexpected time sync response"),
             ServerMessage::Error { message } => panic!("unexpected error: {message}"),
         }
     }
@@ -422,6 +454,103 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_webtransport_time_sync() {
+        let room_id = "1111";
+        let (room_repo, room_service) = setup_room_service(room_id);
+
+        let (server_port, cert_hash) = start_server(room_service).await;
+        let client = test_client(cert_hash);
+
+        let connection = client
+            .connect(format!("https://127.0.0.1:{server_port}/rooms/{room_id}"))
+            .await
+            .expect("connect");
+
+        let (mut send, mut recv) = connection
+            .open_bi()
+            .await
+            .expect("open_bi")
+            .await
+            .expect("open_bi2");
+        let mut request = Vec::new();
+        ClientMessage::TimeSyncRequest
+            .encode(&mut request)
+            .expect("encode time sync request");
+        send.write_all(&request).await.expect("write");
+        send.finish().await.expect("finish");
+
+        let mut buf = Vec::new();
+        recv.read_to_end(&mut buf).await.expect("read_to_end");
+        let t3 = unix_micros();
+        match decode_exact::<ServerMessage>(&buf).expect("valid server message") {
+            ServerMessage::TimeSyncResponse { t1, t2 } => {
+                assert!(t1 <= t2, "t1 must not exceed t2");
+                assert!(
+                    t2.saturating_sub(t1) < 5_000,
+                    "server dwell between t1 and t2 must be negligible ({} µs)",
+                    t2.saturating_sub(t1)
+                );
+                assert!(
+                    t1.abs_diff(t3) < 10_000_000,
+                    "t1 must be close to the local wall clock (diff = {} µs)",
+                    t1.abs_diff(t3)
+                );
+            }
+            other => panic!("unexpected message: {other:?}"),
+        }
+
+        connection.close(wtransport::VarInt::from_u32(0), b"done");
+        sleep(Duration::from_millis(300)).await;
+        assert_eq!(room_repo.participant_count(room_id), Some(0));
+    }
+
+    #[tokio::test]
+    async fn test_webtransport_host_time_sync() {
+        let room_id = "1212";
+        let (room_repo, room_service) = setup_room_service(room_id);
+
+        let (server_port, cert_hash) = start_server(room_service).await;
+        let client = test_client(cert_hash);
+
+        let connection = client
+            .connect(format!(
+                "https://127.0.0.1:{server_port}/rooms/{room_id}?hostToken={HOST_TOKEN}"
+            ))
+            .await
+            .expect("connect as host");
+
+        let (mut send, mut recv) = connection
+            .open_bi()
+            .await
+            .expect("open_bi")
+            .await
+            .expect("open_bi2");
+        let mut request = Vec::new();
+        ClientMessage::TimeSyncRequest
+            .encode(&mut request)
+            .expect("encode time sync request");
+        send.write_all(&request).await.expect("write");
+        send.finish().await.expect("finish");
+
+        let mut buf = Vec::new();
+        recv.read_to_end(&mut buf).await.expect("read_to_end");
+        match decode_exact::<ServerMessage>(&buf).expect("valid server message") {
+            ServerMessage::TimeSyncResponse { t1, t2 } => {
+                assert!(t1 <= t2);
+                assert!(t2.saturating_sub(t1) < 5_000);
+            }
+            other => panic!("unexpected message: {other:?}"),
+        }
+
+        connection.close(wtransport::VarInt::from_u32(0), b"done");
+        sleep(Duration::from_millis(300)).await;
+        assert!(
+            !room_repo.exists(room_id),
+            "room should be removed after host disconnect"
+        );
+    }
+
+    #[tokio::test]
     async fn test_webtransport_unknown_event_ignored() {
         let room_id = "4444";
         let (room_repo, room_service) = setup_room_service(room_id);
@@ -440,7 +569,8 @@ mod tests {
             .expect("open_bi")
             .await
             .expect("open_bi2");
-        send.write_all(&[0x02]).await.expect("write");
+        // 0x7F is an unassigned client -> server event ID.
+        send.write_all(&[0x7F]).await.expect("write");
         send.finish().await.expect("finish");
 
         let mut buf = Vec::new();
