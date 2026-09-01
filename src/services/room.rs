@@ -1,8 +1,9 @@
 use rand::RngExt;
+use uuid::Uuid;
 
 use crate::domain::model::SongData;
 use crate::domain::room::{Room, WaitingRoom};
-use crate::repository::room::RoomRepository;
+use crate::repository::room::{InsertParticipantError, RoomRepository};
 use crate::services::song::{SongService, SongServiceError};
 
 #[derive(Clone)]
@@ -36,6 +37,31 @@ impl RoomService {
         }
 
         Err(CreateRoomError::RoomIdExhausted)
+    }
+
+    /// Assigns a unique participant ID and registers the connection in the room.
+    pub fn join_room(
+        &self,
+        room_id: &str,
+        connection: wtransport::Connection,
+    ) -> Result<Uuid, InsertParticipantError> {
+        let participant_id = Uuid::now_v7();
+        self.repo
+            .insert_participant(room_id, participant_id, connection)?;
+
+        tracing::info!(room_id = %room_id, participant_id = %participant_id, "participant joined room");
+
+        Ok(participant_id)
+    }
+
+    /// Removes a participant from the room (on disconnect).
+    pub fn leave_room(&self, room_id: &str, participant_id: &Uuid) {
+        self.repo.remove_participant(room_id, participant_id);
+        tracing::info!(room_id = %room_id, participant_id = %participant_id, "participant left room");
+    }
+
+    pub fn exists(&self, room_id: &str) -> bool {
+        self.repo.exists(room_id)
     }
 }
 

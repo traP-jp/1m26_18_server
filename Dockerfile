@@ -37,5 +37,6 @@ COPY --from=rust-builder /tmp/app /usr/local/bin/app
 COPY --from=deno-builder /app/dist/textalive.js dist/textalive.js
 
 EXPOSE 8080
+EXPOSE 4433/udp
 
 ENTRYPOINT ["/usr/local/bin/app"]

@@ -2,7 +2,11 @@ use om26_18::{
     repository::{room::RoomRepository, song::SongRepository},
     rest,
     rest::AppState,
-    services::{room::RoomService, song::SongService},
+    services::{
+        room::RoomService,
+        song::SongService,
+        webtransport::{WebTransportError, WebTransportServer},
+    },
 };
 use sqlx::{migrate::MigrateError, mysql::MySqlPoolOptions};
 use tracing_subscriber::EnvFilter;
@@ -17,6 +21,9 @@ enum AppError {
 
     #[error(transparent)]
     Io(#[from] std::io::Error),
+
+    #[error(transparent)]
+    WebTransport(#[from] WebTransportError),
 }
 
 #[tokio::main]
@@ -39,8 +46,19 @@ async fn main() -> Result<(), AppError> {
     let room_service = RoomService::new(room_repo, song_service.clone());
     let state = AppState {
         song_service,
-        room_service,
+        room_service: room_service.clone(),
     };
+
+    let wt_port: u16 = std::env::var("WEBTRANSPORT_PORT")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(4433);
+    let (wt_server, _cert_hash) = WebTransportServer::new(room_service, wt_port)?;
+    tokio::spawn(async move {
+        if let Err(e) = wt_server.serve().await {
+            tracing::error!(error = %e, "WebTransport server error");
+        }
+    });
 
     rest::serve(state).await?;
 
