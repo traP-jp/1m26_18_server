@@ -30,6 +30,15 @@ export interface CompleteSongData {
   title: string
 }
 
+export interface CreateRoomRequest {
+  songUrl: string
+}
+
+export interface CreateRoomResponse {
+  hostToken: string
+  roomId: string
+}
+
 export interface CreateSongRequest {
   artist: string
   lyrics: string

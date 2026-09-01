@@ -1,5 +1,7 @@
 use std::{io, net::SocketAddr, sync::LazyLock, time::Duration};
 
+use axum::extract::Query;
+use serde::Deserialize;
 use tokio::io::AsyncReadExt;
 use tracing::{Instrument, info, warn};
 use uuid::Uuid;
@@ -12,7 +14,7 @@ use wtransport::{
 
 use crate::{
     domain::room::{ClientMessage, ServerMessage},
-    repository::room::InsertParticipantError,
+    repository::room::{InsertHostError, InsertParticipantError},
     services::room::RoomService,
 };
 
@@ -91,13 +93,25 @@ impl WebTransportServer {
         };
 
         let path = session_request.path().to_string();
-        let Some(room_id) = parse_room_path(&path) else {
+        let Some(route) = parse_room_path(&path) else {
             warn!(path = %path, "invalid WebTransport path, expected /rooms/:roomId");
             session_request.not_found().await;
             return;
         };
+        let room_id = route.room_id;
 
-        if !room_service.exists(&room_id) {
+        if let Some(token) = &route.host_token {
+            if let Err(e) = room_service.validate_host_token(&room_id, token) {
+                warn!(room_id = %room_id, error = %e, "host session rejected");
+                match e {
+                    InsertHostError::RoomNotFound => session_request.not_found().await,
+                    InsertHostError::InvalidToken | InsertHostError::HostAlreadyJoined => {
+                        session_request.forbidden().await
+                    }
+                }
+                return;
+            }
+        } else if !room_service.exists(&room_id) {
             warn!(room_id = %room_id, "room not found");
             session_request.not_found().await;
             return;
@@ -110,6 +124,28 @@ impl WebTransportServer {
                 return;
             }
         };
+
+        if let Some(token) = route.host_token {
+            let host_id = match room_service.join_room_as_host(&room_id, &token, connection.clone())
+            {
+                Ok(id) => id,
+                Err(e) => {
+                    warn!(room_id = %room_id, error = %e, "failed to register host after accept");
+                    connection.close(
+                        wtransport::VarInt::from_u32(403),
+                        b"host registration failed",
+                    );
+                    return;
+                }
+            };
+
+            info!(room_id = %room_id, host_id = %host_id, "host joined room");
+
+            let _ = connection.closed().await;
+            info!(room_id = %room_id, host_id = %host_id, "host disconnected, removing room");
+            room_service.remove_room(&room_id);
+            return;
+        }
 
         info!(room_id = %room_id, "WebTransport session accepted, joining room");
 
@@ -144,11 +180,26 @@ impl WebTransportServer {
     }
 }
 
-fn parse_room_path(path: &str) -> Option<String> {
+struct RoomRoute {
+    room_id: String,
+    host_token: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct RoomQuery {
+    #[serde(rename = "hostToken")]
+    host_token: Option<String>,
+}
+
+fn parse_room_path(path: &str) -> Option<RoomRoute> {
     // Strip the query string via http::Uri, then match the route with matchit.
     let uri = http::Uri::try_from(path).ok()?;
     let matched = ROOM_ROUTER.at(uri.path()).ok()?;
-    Some(matched.params.get("room_id")?.to_string())
+    let room_id = matched.params.get("room_id")?.to_string();
+    let host_token = Query::<RoomQuery>::try_from_uri(&uri)
+        .ok()
+        .and_then(|query| query.0.host_token);
+    Some(RoomRoute { room_id, host_token })
 }
 
 async fn handle_bi_stream(
@@ -223,7 +274,10 @@ mod tests {
         services::{room::RoomService, song::SongService},
     };
     use tokio::io::AsyncReadExt;
-    use wtransport::{ClientConfig, Endpoint};
+    use tokio::time::sleep;
+    use wtransport::{ClientConfig, Endpoint, endpoint::endpoint_side};
+
+    const HOST_TOKEN: &str = "test-host-token";
 
     fn dummy_complete_song() -> CompleteSongData {
         serde_json::from_value(serde_json::json!({
@@ -246,51 +300,36 @@ mod tests {
         let room_service = RoomService::new(room_repo.clone(), song_service);
         room_repo.insert(
             room_id.to_string(),
-            Room::Waiting(WaitingRoom::new(dummy_complete_song())),
+            Room::Waiting(WaitingRoom::new(
+                dummy_complete_song(),
+                HOST_TOKEN.to_string(),
+            )),
         );
         (room_repo, room_service)
     }
 
-    #[tokio::test]
-    async fn test_parse_room_path() {
-        assert_eq!(parse_room_path("/rooms/1234"), Some("1234".to_string()));
-        assert_eq!(parse_room_path("/rooms/abcd"), Some("abcd".to_string()));
-        assert_eq!(
-            parse_room_path("/rooms/1234?foo=bar"),
-            Some("1234".to_string())
-        );
-        assert_eq!(parse_room_path("/rooms/"), None);
-        assert_eq!(parse_room_path("/rooms"), None);
-        assert_eq!(parse_room_path("/other/1234"), None);
-        assert_eq!(parse_room_path("/rooms/1234/extra"), None);
-        assert_eq!(parse_room_path("/rooms/1234/"), None);
-    }
-
-    #[tokio::test]
-    async fn test_webtransport_join_flow() {
-        let room_id = "9999";
-        let (room_repo, room_service) = setup_room_service(room_id);
-
+    async fn start_server(room_service: RoomService) -> (u16, Sha256Digest) {
         let (server, cert_hash) =
-            WebTransportServer::new(room_service.clone(), 0).expect("server creation");
+            WebTransportServer::new(room_service, 0).expect("server creation");
         let server_port = server.local_addr().expect("local addr").port();
-
         tokio::spawn(async move {
             let _ = server.serve().await;
         });
+        sleep(Duration::from_millis(200)).await;
+        (server_port, cert_hash)
+    }
 
-        tokio::time::sleep(Duration::from_millis(200)).await;
+    fn test_client(cert_hash: Sha256Digest) -> Endpoint<endpoint_side::Client> {
+        Endpoint::client(
+            ClientConfig::builder()
+                .with_bind_default()
+                .with_server_certificate_hashes([cert_hash])
+                .build(),
+        )
+        .expect("client endpoint")
+    }
 
-        let client_config = ClientConfig::builder()
-            .with_bind_default()
-            .with_server_certificate_hashes([cert_hash])
-            .build();
-        let client_endpoint = Endpoint::client(client_config).expect("client endpoint");
-        let connection = client_endpoint
-            .connect(format!("https://127.0.0.1:{server_port}/rooms/{room_id}"))
-            .await
-            .expect("connect");
-
+    async fn join_as_participant(connection: &wtransport::Connection) -> Uuid {
         let (mut send, mut recv) = connection
             .open_bi()
             .await
@@ -303,19 +342,61 @@ mod tests {
 
         let mut buf = Vec::new();
         recv.read_to_end(&mut buf).await.expect("read_to_end");
-        let server_msg: ServerMessage = serde_json::from_slice(&buf).expect("valid server message");
-
-        match server_msg {
-            ServerMessage::Joined { participant_id } => {
-                assert!(!participant_id.to_string().is_empty());
-                tokio::time::sleep(Duration::from_millis(100)).await;
-                assert_eq!(room_repo.participant_count(room_id), Some(1));
-                connection.close(wtransport::VarInt::from_u32(0), b"done");
-                tokio::time::sleep(Duration::from_millis(300)).await;
-                assert_eq!(room_repo.participant_count(room_id), Some(0));
-            }
+        match serde_json::from_slice::<ServerMessage>(&buf).expect("valid server message") {
+            ServerMessage::Joined { participant_id } => participant_id,
             ServerMessage::Error { message } => panic!("unexpected error: {message}"),
         }
+    }
+
+    #[tokio::test]
+    async fn test_parse_room_path() {
+        let route = parse_room_path("/rooms/1234").unwrap();
+        assert_eq!(route.room_id, "1234");
+        assert_eq!(route.host_token, None);
+        let route = parse_room_path("/rooms/abcd").unwrap();
+        assert_eq!(route.room_id, "abcd");
+        assert_eq!(route.host_token, None);
+        let route = parse_room_path("/rooms/1234?foo=bar").unwrap();
+        assert_eq!(route.room_id, "1234");
+        assert_eq!(route.host_token, None);
+        let route = parse_room_path("/rooms/1234?hostToken=tok").unwrap();
+        assert_eq!(route.room_id, "1234");
+        assert_eq!(route.host_token.as_deref(), Some("tok"));
+        let route = parse_room_path("/rooms/1234?foo=bar&hostToken=tok").unwrap();
+        assert_eq!(route.host_token.as_deref(), Some("tok"));
+        // percent-decoding via serde_urlencoded/form_urlencoded
+        let route = parse_room_path("/rooms/1234?hostToken=a%20b").unwrap();
+        assert_eq!(route.host_token.as_deref(), Some("a b"));
+        let route = parse_room_path("/rooms/1234?hostToken=a%2Fb").unwrap();
+        assert_eq!(route.host_token.as_deref(), Some("a/b"));
+        assert!(parse_room_path("/rooms/").is_none());
+        assert!(parse_room_path("/rooms").is_none());
+        assert!(parse_room_path("/other/1234").is_none());
+        assert!(parse_room_path("/rooms/1234/extra").is_none());
+        assert!(parse_room_path("/rooms/1234/").is_none());
+    }
+
+    #[tokio::test]
+    async fn test_webtransport_join_flow() {
+        let room_id = "9999";
+        let (room_repo, room_service) = setup_room_service(room_id);
+
+        let (server_port, cert_hash) = start_server(room_service).await;
+        let client = test_client(cert_hash);
+
+        let connection = client
+            .connect(format!("https://127.0.0.1:{server_port}/rooms/{room_id}"))
+            .await
+            .expect("connect");
+
+        let participant_id = join_as_participant(&connection).await;
+        assert!(!participant_id.to_string().is_empty());
+
+        sleep(Duration::from_millis(100)).await;
+        assert_eq!(room_repo.participant_count(room_id), Some(1));
+        connection.close(wtransport::VarInt::from_u32(0), b"done");
+        sleep(Duration::from_millis(300)).await;
+        assert_eq!(room_repo.participant_count(room_id), Some(0));
     }
 
     #[tokio::test]
@@ -327,26 +408,131 @@ mod tests {
         let song_service = SongService::new(song_repo);
         let room_service = RoomService::new(room_repo, song_service);
 
-        let (server, cert_hash) =
-            WebTransportServer::new(room_service, 0).expect("server creation");
-        let server_port = server.local_addr().unwrap().port();
-        tokio::spawn(async move {
-            let _ = server.serve().await;
-        });
-        tokio::time::sleep(Duration::from_millis(200)).await;
+        let (server_port, cert_hash) = start_server(room_service).await;
+        let client = test_client(cert_hash);
 
-        let client_config = ClientConfig::builder()
-            .with_bind_default()
-            .with_server_certificate_hashes([cert_hash])
-            .build();
-        let client_endpoint = Endpoint::client(client_config).unwrap();
         // Connecting to a nonexistent room: the server rejects the session with not_found, so connect itself fails.
-        let result = client_endpoint
+        let result = client
             .connect(format!("https://127.0.0.1:{server_port}/rooms/0000"))
             .await;
         assert!(
             result.is_err(),
             "expected connect to fail for nonexistent room, but it succeeded"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_webtransport_host_join_flow() {
+        let room_id = "8888";
+        let (room_repo, room_service) = setup_room_service(room_id);
+
+        let (server_port, cert_hash) = start_server(room_service).await;
+        let client = test_client(cert_hash);
+
+        let connection = client
+            .connect(format!(
+                "https://127.0.0.1:{server_port}/rooms/{room_id}?hostToken={HOST_TOKEN}"
+            ))
+            .await
+            .expect("connect as host");
+
+        sleep(Duration::from_millis(200)).await;
+        assert!(room_repo.host_id(room_id).is_some());
+        assert_eq!(room_repo.participant_count(room_id), Some(0));
+
+        connection.close(wtransport::VarInt::from_u32(0), b"done");
+        sleep(Duration::from_millis(300)).await;
+        assert!(
+            !room_repo.exists(room_id),
+            "room should be removed after host disconnect"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_webtransport_host_invalid_token_rejected() {
+        let room_id = "7777";
+        let (room_repo, room_service) = setup_room_service(room_id);
+
+        let (server_port, cert_hash) = start_server(room_service).await;
+        let client = test_client(cert_hash);
+
+        let result = client
+            .connect(format!(
+                "https://127.0.0.1:{server_port}/rooms/{room_id}?hostToken=wrong-token"
+            ))
+            .await;
+        assert!(
+            result.is_err(),
+            "expected connect to fail with invalid host token"
+        );
+        assert!(room_repo.host_id(room_id).is_none());
+        assert!(room_repo.exists(room_id));
+    }
+
+    #[tokio::test]
+    async fn test_webtransport_second_host_rejected() {
+        let room_id = "6666";
+        let (room_repo, room_service) = setup_room_service(room_id);
+
+        let (server_port, cert_hash) = start_server(room_service).await;
+        let client = test_client(cert_hash);
+
+        let first = client
+            .connect(format!(
+                "https://127.0.0.1:{server_port}/rooms/{room_id}?hostToken={HOST_TOKEN}"
+            ))
+            .await
+            .expect("first host connect");
+        sleep(Duration::from_millis(200)).await;
+        assert!(room_repo.host_id(room_id).is_some());
+
+        let second = client
+            .connect(format!(
+                "https://127.0.0.1:{server_port}/rooms/{room_id}?hostToken={HOST_TOKEN}"
+            ))
+            .await;
+        assert!(second.is_err(), "expected second host connect to fail");
+        assert!(room_repo.host_id(room_id).is_some());
+
+        first.close(wtransport::VarInt::from_u32(0), b"done");
+        sleep(Duration::from_millis(300)).await;
+        assert!(!room_repo.exists(room_id));
+    }
+
+    #[tokio::test]
+    async fn test_webtransport_participant_join_after_host() {
+        let room_id = "5555";
+        let (room_repo, room_service) = setup_room_service(room_id);
+
+        let (server_port, cert_hash) = start_server(room_service).await;
+        let client = test_client(cert_hash);
+
+        let _host_connection = client
+            .connect(format!(
+                "https://127.0.0.1:{server_port}/rooms/{room_id}?hostToken={HOST_TOKEN}"
+            ))
+            .await
+            .expect("connect as host");
+        sleep(Duration::from_millis(200)).await;
+        assert!(room_repo.host_id(room_id).is_some());
+
+        let participant_connection = client
+            .connect(format!("https://127.0.0.1:{server_port}/rooms/{room_id}"))
+            .await
+            .expect("connect as participant");
+        let participant_id = join_as_participant(&participant_connection).await;
+        assert!(!participant_id.to_string().is_empty());
+
+        sleep(Duration::from_millis(100)).await;
+        assert_eq!(room_repo.participant_count(room_id), Some(1));
+        assert!(room_repo.host_id(room_id).is_some());
+
+        participant_connection.close(wtransport::VarInt::from_u32(0), b"done");
+        sleep(Duration::from_millis(300)).await;
+        assert_eq!(room_repo.participant_count(room_id), Some(0));
+        assert!(
+            room_repo.exists(room_id),
+            "room should survive a participant disconnect"
         );
     }
 }

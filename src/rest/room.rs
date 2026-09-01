@@ -22,7 +22,14 @@ pub async fn create_room(
     Json(body): Json<CreateRoomRequest>,
 ) -> impl IntoResponse {
     match state.room_service.create_room(&body.song_url).await {
-        Ok(room_id) => (StatusCode::CREATED, Json(CreateRoomResponse { room_id })).into_response(),
+        Ok((room_id, host_token)) => (
+            StatusCode::CREATED,
+            Json(CreateRoomResponse {
+                room_id,
+                host_token,
+            }),
+        )
+            .into_response(),
         Err(CreateRoomError::SongNotComplete) => (
             StatusCode::BAD_REQUEST,
             Json(json!({"error": "song data is incomplete"})),

@@ -2798,6 +2798,7 @@ dependencies = [
  "regex",
  "syn 2.0.119",
  "url",
+ "uuid",
 ]
 
 [[package]]

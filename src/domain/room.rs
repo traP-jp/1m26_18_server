@@ -8,16 +8,54 @@ use crate::domain::model::CompleteSongData;
 
 pub enum Room {
     Waiting(WaitingRoom),
+    HostJoined(HostJoinedRoom),
+}
+
+impl Room {
+    pub fn participants(&self) -> &HashMap<Uuid, wtransport::Connection> {
+        match self {
+            Room::Waiting(waiting) => &waiting.participants,
+            Room::HostJoined(joined) => &joined.participants,
+        }
+    }
+
+    pub(crate) fn participants_mut(&mut self) -> &mut HashMap<Uuid, wtransport::Connection> {
+        match self {
+            Room::Waiting(waiting) => &mut waiting.participants,
+            Room::HostJoined(joined) => &mut joined.participants,
+        }
+    }
+}
+
+pub struct Host {
+    id: Uuid,
+    connection: wtransport::Connection,
+}
+
+impl Host {
+    pub fn new(id: Uuid, connection: wtransport::Connection) -> Self {
+        Self { id, connection }
+    }
+
+    pub fn id(&self) -> Uuid {
+        self.id
+    }
+
+    pub fn connection(&self) -> &wtransport::Connection {
+        &self.connection
+    }
 }
 
 pub struct WaitingRoom {
+    host_token: String,
     song: CompleteSongData,
     participants: HashMap<Uuid, wtransport::Connection>,
 }
 
 impl WaitingRoom {
-    pub fn new(song: CompleteSongData) -> Self {
+    pub fn new(song: CompleteSongData, host_token: String) -> Self {
         Self {
+            host_token,
             song,
             participants: HashMap::new(),
         }
@@ -27,16 +65,32 @@ impl WaitingRoom {
         &self.song
     }
 
-    pub fn participants(&self) -> &HashMap<Uuid, wtransport::Connection> {
-        &self.participants
+    pub fn host_token(&self) -> &str {
+        &self.host_token
     }
 
-    pub fn insert_participant(&mut self, participant_id: Uuid, connection: wtransport::Connection) {
-        self.participants.insert(participant_id, connection);
+    pub fn join_host(self, host: Host) -> HostJoinedRoom {
+        HostJoinedRoom {
+            host,
+            song: self.song,
+            participants: self.participants,
+        }
+    }
+}
+
+pub struct HostJoinedRoom {
+    host: Host,
+    song: CompleteSongData,
+    participants: HashMap<Uuid, wtransport::Connection>,
+}
+
+impl HostJoinedRoom {
+    pub fn host(&self) -> &Host {
+        &self.host
     }
 
-    pub fn remove_participant(&mut self, participant_id: &Uuid) -> Option<wtransport::Connection> {
-        self.participants.remove(participant_id)
+    pub fn song(&self) -> &CompleteSongData {
+        &self.song
     }
 }
 
@@ -50,6 +104,7 @@ pub struct CreateRoomRequest {
 #[serde(rename_all = "camelCase")]
 pub struct CreateRoomResponse {
     pub room_id: String,
+    pub host_token: Uuid,
 }
 
 /// Message sent from the client to the server over WebTransport.

@@ -42,7 +42,7 @@ tokio = { features = [
 tower-http = { features = ["cors", "trace"], version = "0.7.0" }
 tracing = "0.1.44"
 tracing-subscriber = { features = ["env-filter"], version = "0.3.23" }
-utoipa = { features = ["axum_extras", "url"], version = "5.5.0" }
+utoipa = { features = ["axum_extras", "url", "uuid"], version = "5.5.0" }
 utoipa-axum = "0.2.0"
 utoipa-swagger-ui = { default-features = false, features = [
   "axum",
