@@ -24,24 +24,30 @@
 //!
 //! Currently defined events:
 //!
-//! | ID   | Direction | Event           | Payload                       |
-//! |------|-----------|-----------------|-------------------------------|
-//! | 0x01 | C -> S    | Join            | empty                         |
-//! | 0x02 | C -> S    | TimeSyncRequest | empty                         |
-//! | 0x81 | S -> C    | Joined          | 16-byte UUID (participant id) |
-//! | 0x83 | S -> C    | TimeSyncResponse| u64 t1 + u64 t2 (unix µs)     |
-//! | 0x82 | S -> C    | Error           | u16 length + UTF-8 message    |
+//! | ID   | Direction | Event              | Payload                            |
+//! |------|-----------|--------------------|------------------------------------|
+//! | 0x01 | C -> S    | Join               | empty                              |
+//! | 0x02 | C -> S    | TimeSyncRequest    | empty                              |
+//! | 0x03 | C -> S    | CalibrationStart   | 3 × u64 (unix µs, host sound times)|
+//! | 0x04 | C -> S    | CalibrationDetect  | u8 index + u64 (unix µs, detection)|
+//! | 0x81 | S -> C    | Joined             | 16-byte UUID (participant id)      |
+//! | 0x83 | S -> C    | TimeSyncResponse   | u64 t1 + u64 t2 (unix µs)          |
+//! | 0x82 | S -> C    | Error              | u16 length + UTF-8 message         |
 
 use std::str::from_utf8;
 
 use uuid::Uuid;
 
-use crate::domain::room::{ClientMessage, ServerMessage};
+use crate::domain::room::{CALIBRATION_SOUND_COUNT, ClientMessage, ServerMessage};
 
 /// Event ID of [`ClientMessage::Join`].
 pub const EVENT_JOIN: u8 = 0x01;
 /// Event ID of [`ClientMessage::TimeSyncRequest`].
 pub const EVENT_TIME_SYNC_REQUEST: u8 = 0x02;
+/// Event ID of [`ClientMessage::CalibrationStart`].
+pub const EVENT_CALIBRATION_START: u8 = 0x03;
+/// Event ID of [`ClientMessage::CalibrationDetect`].
+pub const EVENT_CALIBRATION_DETECT: u8 = 0x04;
 /// Event ID of [`ServerMessage::Joined`].
 pub const EVENT_JOINED: u8 = 0x81;
 /// Event ID of [`ServerMessage::TimeSyncResponse`].
@@ -53,6 +59,8 @@ pub const EVENT_ERROR: u8 = 0x82;
 pub enum EncodeError {
     #[error("string length {0} exceeds the u16 length prefix limit")]
     StringTooLong(usize),
+    #[error("sound index {0} does not fit in a u8")]
+    IndexOutOfRange(usize),
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -140,6 +148,25 @@ impl Decode for u64 {
     }
 }
 
+impl<const N: usize> Encode for [u64; N] {
+    fn encode(&self, buf: &mut Vec<u8>) -> Result<(), EncodeError> {
+        for value in self {
+            value.encode(buf)?;
+        }
+        Ok(())
+    }
+}
+
+impl<const N: usize> Decode for [u64; N] {
+    fn decode(buf: &mut &[u8]) -> Result<Self, DecodeError> {
+        let mut array = [0u64; N];
+        for value in &mut array {
+            *value = u64::decode(buf)?;
+        }
+        Ok(array)
+    }
+}
+
 impl Encode for str {
     fn encode(&self, buf: &mut Vec<u8>) -> Result<(), EncodeError> {
         let len = self.len();
@@ -187,6 +214,21 @@ impl Encode for ClientMessage {
         match self {
             ClientMessage::Join => EVENT_JOIN.encode(buf),
             ClientMessage::TimeSyncRequest => EVENT_TIME_SYNC_REQUEST.encode(buf),
+            ClientMessage::CalibrationStart { times } => {
+                EVENT_CALIBRATION_START.encode(buf)?;
+                times.encode(buf)
+            }
+            ClientMessage::CalibrationDetect {
+                sound_index,
+                detected_at,
+            } => {
+                // Validate before writing so a failed encode leaves the buffer untouched.
+                let sound_index = u8::try_from(*sound_index)
+                    .map_err(|_| EncodeError::IndexOutOfRange(*sound_index))?;
+                EVENT_CALIBRATION_DETECT.encode(buf)?;
+                sound_index.encode(buf)?;
+                detected_at.encode(buf)
+            }
         }
     }
 }
@@ -196,6 +238,13 @@ impl Decode for ClientMessage {
         match u8::decode(buf)? {
             EVENT_JOIN => Ok(ClientMessage::Join),
             EVENT_TIME_SYNC_REQUEST => Ok(ClientMessage::TimeSyncRequest),
+            EVENT_CALIBRATION_START => Ok(ClientMessage::CalibrationStart {
+                times: <[u64; CALIBRATION_SOUND_COUNT]>::decode(buf)?,
+            }),
+            EVENT_CALIBRATION_DETECT => Ok(ClientMessage::CalibrationDetect {
+                sound_index: usize::from(u8::decode(buf)?),
+                detected_at: u64::decode(buf)?,
+            }),
             id => Err(DecodeError::UnknownEventId(id)),
         }
     }
@@ -311,6 +360,109 @@ mod tests {
             }
             other => panic!("unexpected message: {other:?}"),
         }
+    }
+
+    #[test]
+    fn calibration_start_roundtrip() {
+        let times = [
+            1_700_000_000_000_000,
+            1_700_000_001_000_000,
+            1_700_000_002_000_000,
+        ];
+        let mut buf = Vec::new();
+        ClientMessage::CalibrationStart { times }
+            .encode(&mut buf)
+            .expect("encode calibration start");
+        assert_eq!(buf[0], EVENT_CALIBRATION_START);
+        assert_eq!(buf.len(), 1 + CALIBRATION_SOUND_COUNT * 8);
+        match decode_exact::<ClientMessage>(&buf).expect("decode calibration start") {
+            ClientMessage::CalibrationStart { times: decoded } => assert_eq!(decoded, times),
+            other => panic!("unexpected message: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn calibration_detect_roundtrip() {
+        let mut buf = Vec::new();
+        ClientMessage::CalibrationDetect {
+            sound_index: 2,
+            detected_at: 1_700_000_000_050_000,
+        }
+        .encode(&mut buf)
+        .expect("encode calibration detect");
+        assert_eq!(buf[0], EVENT_CALIBRATION_DETECT);
+        assert_eq!(buf.len(), 10);
+        match decode_exact::<ClientMessage>(&buf).expect("decode calibration detect") {
+            ClientMessage::CalibrationDetect {
+                sound_index,
+                detected_at,
+            } => assert_eq!((sound_index, detected_at), (2, 1_700_000_000_050_000)),
+            other => panic!("unexpected message: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn calibration_detect_index_too_large() {
+        let mut buf = Vec::new();
+        assert!(matches!(
+            ClientMessage::CalibrationDetect {
+                sound_index: usize::from(u8::MAX) + 1,
+                detected_at: 0,
+            }
+            .encode(&mut buf),
+            Err(EncodeError::IndexOutOfRange(_))
+        ));
+        assert!(buf.is_empty());
+    }
+
+    #[test]
+    fn calibration_truncated_payload() {
+        // One host time is 8 bytes; truncate the start payload mid-way.
+        let mut buf = vec![EVENT_CALIBRATION_START];
+        buf.extend_from_slice(&[0u8; 8]);
+        assert!(matches!(
+            decode_exact::<ClientMessage>(&buf),
+            Err(DecodeError::UnexpectedEof)
+        ));
+        // A detection is one index byte plus an 8-byte timestamp.
+        let mut buf = vec![EVENT_CALIBRATION_DETECT, 0x01];
+        buf.extend_from_slice(&[0u8; 7]);
+        assert!(matches!(
+            decode_exact::<ClientMessage>(&buf),
+            Err(DecodeError::UnexpectedEof)
+        ));
+        assert!(matches!(
+            decode_exact::<ClientMessage>(&[EVENT_CALIBRATION_DETECT]),
+            Err(DecodeError::UnexpectedEof)
+        ));
+    }
+
+    #[test]
+    fn calibration_trailing_bytes() {
+        let mut buf = Vec::new();
+        ClientMessage::CalibrationStart {
+            times: [0; CALIBRATION_SOUND_COUNT],
+        }
+        .encode(&mut buf)
+        .expect("encode calibration start");
+        buf.push(0x00);
+        assert!(matches!(
+            decode_exact::<ClientMessage>(&buf),
+            Err(DecodeError::TrailingBytes)
+        ));
+
+        let mut buf = Vec::new();
+        ClientMessage::CalibrationDetect {
+            sound_index: 0,
+            detected_at: 0,
+        }
+        .encode(&mut buf)
+        .expect("encode calibration detect");
+        buf.push(0x00);
+        assert!(matches!(
+            decode_exact::<ClientMessage>(&buf),
+            Err(DecodeError::TrailingBytes)
+        ));
     }
 
     #[test]
