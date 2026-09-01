@@ -23,9 +23,7 @@ pub enum TextAliveError {
 #[tracing::instrument]
 pub async fn fetch_song_data(url: &str) -> Result<FetchedSongData, TextAliveError> {
     let tmp_file_path = env::temp_dir().join(format!("{}.json", Uuid::now_v7()));
-    let tmp_file_path_str = tmp_file_path
-        .to_str()
-        .ok_or_else(|| TextAliveError::TempFilePath)?;
+    let tmp_file_path_str = tmp_file_path.to_str().ok_or(TextAliveError::TempFilePath)?;
     let output = Command::new("deno")
         .arg("run")
         .arg("--allow-env")

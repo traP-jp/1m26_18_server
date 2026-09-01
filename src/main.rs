@@ -1,3 +1,5 @@
+use std::{env, io};
+
 use om26_18::{
     repository::{room::RoomRepository, song::SongRepository},
     rest,
@@ -20,7 +22,7 @@ enum AppError {
     Migration(#[from] MigrateError),
 
     #[error(transparent)]
-    Io(#[from] std::io::Error),
+    Io(#[from] io::Error),
 
     #[error(transparent)]
     WebTransport(#[from] WebTransportError),
@@ -34,7 +36,7 @@ async fn main() -> Result<(), AppError> {
         )
         .init();
 
-    let database_url = std::env::var("DATABASE_URL")
+    let database_url = env::var("DATABASE_URL")
         .unwrap_or_else(|_| "mysql://root:password@127.0.0.1:3306/database".to_string());
     let pool = MySqlPoolOptions::new().connect(&database_url).await?;
 
@@ -49,7 +51,7 @@ async fn main() -> Result<(), AppError> {
         room_service: room_service.clone(),
     };
 
-    let wt_port: u16 = std::env::var("WEBTRANSPORT_PORT")
+    let wt_port: u16 = env::var("WEBTRANSPORT_PORT")
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or(4433);

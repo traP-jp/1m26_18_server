@@ -1,26 +1,55 @@
 [package]
+default-run = "om26_18"
+edition = "2024"
 name = "om26_18"
 version = "0.1.0"
-edition = "2024"
-default-run = "om26_18"
 
 [dependencies]
-axum = { version = "0.8.9", default-features = false, features = ["http1", "json", "query", "tokio", "tracing"] }
+axum = { default-features = false, features = [
+  "http1",
+  "json",
+  "query",
+  "tokio",
+  "tracing",
+], version = "0.8.9" }
 http = "1.5.0"
 matchit = "0.9.2"
 parking_lot = "0.12.5"
 rand = "0.10.2"
-reqwest = { version = "0.13.4", default-features = false, features = ["default-tls", "http2", "json"] }
-serde = { version = "1.0.229", features = ["derive"] }
+reqwest = { default-features = false, features = [
+  "default-tls",
+  "http2",
+  "json",
+], version = "0.13.4" }
+serde = { features = ["derive"], version = "1.0.229" }
 serde_json = "1.0.151"
-sqlx = { version = "0.8.6", features = ["runtime-tokio", "tls-rustls", "mysql", "migrate"] }
+sqlx = { features = [
+  "migrate",
+  "mysql",
+  "runtime-tokio",
+  "tls-rustls",
+], version = "0.8.6" }
 thiserror = "2.0.20"
-tokio = { version = "1.53.1", features = ["net", "process", "rt-multi-thread", "fs", "macros", "io-util", "time"] }
-tower-http = { version = "0.7.0", features = ["cors", "trace"] }
+tokio = { features = [
+  "fs",
+  "io-util",
+  "macros",
+  "net",
+  "process",
+  "rt-multi-thread",
+  "time",
+], version = "1.53.1" }
+tower-http = { features = ["cors", "trace"], version = "0.7.0" }
 tracing = "0.1.44"
-tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
-utoipa = { version = "5.5.0", features = ["axum_extras", "url"] }
+tracing-subscriber = { features = ["env-filter"], version = "0.3.23" }
+utoipa = { features = ["axum_extras", "url"], version = "5.5.0" }
 utoipa-axum = "0.2.0"
-utoipa-swagger-ui = { version = "9.0.2", default-features = false, features = ["axum", "vendored"] }
-uuid = { version = "1.24.0", features = ["v7", "serde"] }
+utoipa-swagger-ui = { default-features = false, features = [
+  "axum",
+  "vendored",
+], version = "9.0.2" }
+uuid = { features = ["serde", "v7"], version = "1.24.0" }
 wtransport = "0.7.1"
+
+[lints.clippy]
+absolute_paths = "warn"

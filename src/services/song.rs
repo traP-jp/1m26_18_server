@@ -1,5 +1,7 @@
-use crate::domain::lyrics::split_lyrics_with_songle;
-use crate::domain::model::{CompleteSongData, FetchedSongData, SongData, StoredSong};
+use crate::domain::lyrics::{LyricsSplitError, split_lyrics_with_songle};
+use crate::domain::model::{
+    CompleteSongData, FetchedSongData, IncompleteSongData, SongData, StoredSong,
+};
 use crate::repository::song::SongRepository;
 use crate::services::{songle, textalive};
 
@@ -10,7 +12,7 @@ pub enum SongServiceError {
     #[error(transparent)]
     Sqlx(#[from] sqlx::Error),
     #[error(transparent)]
-    LyricsSplit(#[from] crate::domain::lyrics::LyricsSplitError),
+    LyricsSplit(#[from] LyricsSplitError),
 }
 
 #[derive(Clone)]
@@ -39,13 +41,11 @@ impl SongService {
                     );
                     Ok(SongData::Complete(complete))
                 } else {
-                    Ok(SongData::Incomplete(
-                        crate::domain::model::IncompleteSongData::new(
-                            inc.duration_ms,
-                            inc.beats,
-                            inc.segments,
-                        ),
-                    ))
+                    Ok(SongData::Incomplete(IncompleteSongData::new(
+                        inc.duration_ms,
+                        inc.beats,
+                        inc.segments,
+                    )))
                 }
             }
         }
@@ -116,7 +116,7 @@ pub enum CreateSongError {
     #[error(transparent)]
     Sqlx(#[from] sqlx::Error),
     #[error(transparent)]
-    LyricsSplit(#[from] crate::domain::lyrics::LyricsSplitError),
+    LyricsSplit(#[from] LyricsSplitError),
     #[error(transparent)]
     Songle(#[from] songle::SongleError),
     #[error("song is already public (complete data available)")]

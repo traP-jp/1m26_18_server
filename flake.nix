@@ -18,10 +18,20 @@
         };
       in
       {
+        apps = {
+          fmt = {
+            type = "app";
+            program = toString (pkgs.writeShellScript "fmt" ''
+              ${pkgs.taplo}/bin/taplo fmt *.toml
+              ${rustToolchain}/bin/cargo fmt
+            '');
+          };
+        };
         devShells.default = pkgs.mkShell {
           packages = [
             pkgs.deno
             pkgs.sqlx-cli
+            pkgs.taplo
             rustToolchain
           ];
           RUST_SRC_PATH = "${rustToolchain}/lib/rustlib/src/rust/library";

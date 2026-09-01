@@ -1,5 +1,5 @@
 use crate::domain::model::Phrase;
-use crate::services::songle::SongleLyricsRaw;
+use crate::services::songle::{SongleChar, SongleLyricsRaw};
 
 pub fn split_lyrics_with_songle(
     lyrics: &str,
@@ -23,8 +23,7 @@ pub fn split_lyrics_with_songle(
         let char_count: usize = phrase_words.iter().map(|w| w.len()).sum();
         let slice: String = stripped[idx..idx + char_count].iter().collect();
         idx += char_count;
-        let flat: Vec<&crate::services::songle::SongleChar> =
-            phrase_words.iter().flat_map(|w| w.iter()).collect();
+        let flat: Vec<&SongleChar> = phrase_words.iter().flat_map(|w| w.iter()).collect();
         let starts_at_ms = flat.first().map(|c| c.start_time * 1000.0).unwrap_or(0.0);
         let ends_at_ms = flat.last().map(|c| c.end_time * 1000.0).unwrap_or(0.0);
         out.push(Phrase::new(slice, starts_at_ms, ends_at_ms));

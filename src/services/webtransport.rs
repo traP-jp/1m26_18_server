@@ -1,9 +1,14 @@
-use std::{sync::LazyLock, time::Duration};
+use std::{io, net::SocketAddr, sync::LazyLock, time::Duration};
 
 use tokio::io::AsyncReadExt;
 use tracing::{Instrument, info, warn};
 use uuid::Uuid;
-use wtransport::{Endpoint, Identity, ServerConfig, endpoint::IncomingSession};
+use wtransport::{
+    Endpoint, Identity, ServerConfig,
+    endpoint::{IncomingSession, endpoint_side::Server},
+    error::StreamWriteError,
+    tls::{Sha256Digest, error::InvalidSan},
+};
 
 use crate::{
     domain::room::{ClientMessage, ServerMessage},
@@ -20,7 +25,7 @@ static ROOM_ROUTER: LazyLock<matchit::Router<()>> = LazyLock::new(|| {
 });
 
 pub struct WebTransportServer {
-    endpoint: Endpoint<wtransport::endpoint::endpoint_side::Server>,
+    endpoint: Endpoint<Server>,
     room_service: RoomService,
 }
 
@@ -29,7 +34,7 @@ impl WebTransportServer {
     pub fn new(
         room_service: RoomService,
         port: u16,
-    ) -> Result<(Self, wtransport::tls::Sha256Digest), WebTransportError> {
+    ) -> Result<(Self, Sha256Digest), WebTransportError> {
         let identity = Identity::self_signed(["localhost", "127.0.0.1"])?;
 
         let hash = identity.certificate_chain().as_slice()[0].hash();
@@ -57,11 +62,11 @@ impl WebTransportServer {
         ))
     }
 
-    pub fn local_addr(&self) -> std::io::Result<std::net::SocketAddr> {
+    pub fn local_addr(&self) -> io::Result<SocketAddr> {
         self.endpoint.local_addr()
     }
 
-    pub async fn serve(self) -> std::io::Result<()> {
+    pub async fn serve(self) -> io::Result<()> {
         info!("WebTransport serve loop started");
         let mut id = 0u64;
         loop {
@@ -157,7 +162,7 @@ async fn handle_bi_stream(
     limited
         .read_to_end(&mut buf)
         .await
-        .map_err(|e| WebTransportError::Io(std::io::Error::other(e)))?;
+        .map_err(|e| WebTransportError::Io(io::Error::other(e)))?;
 
     if buf.is_empty() {
         // Treat an empty request as a join (browser implementations differ).
@@ -201,11 +206,11 @@ async fn send_message(
 #[derive(Debug, thiserror::Error)]
 pub enum WebTransportError {
     #[error("invalid SAN: {0}")]
-    InvalidSan(#[from] wtransport::tls::error::InvalidSan),
+    InvalidSan(#[from] InvalidSan),
     #[error("IO error: {0}")]
-    Io(#[from] std::io::Error),
+    Io(#[from] io::Error),
     #[error("stream write error: {0}")]
-    StreamWrite(#[from] wtransport::error::StreamWriteError),
+    StreamWrite(#[from] StreamWriteError),
 }
 
 #[cfg(test)]
