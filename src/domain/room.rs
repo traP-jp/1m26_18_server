@@ -108,19 +108,17 @@ pub struct CreateRoomResponse {
 }
 
 /// Message sent from the client to the server over WebTransport.
-#[derive(Deserialize, Serialize, Debug)]
-#[serde(tag = "type", rename_all = "camelCase")]
+///
+/// The wire encoding is defined in [`crate::domain::wire`].
+#[derive(Debug)]
 pub enum ClientMessage {
     Join,
 }
 
 /// Message sent from the server to the client over WebTransport.
-#[derive(Deserialize, Serialize, Debug)]
-#[serde(
-    tag = "type",
-    rename_all = "camelCase",
-    rename_all_fields = "camelCase"
-)]
+///
+/// The wire encoding is defined in [`crate::domain::wire`].
+#[derive(Debug)]
 pub enum ServerMessage {
     Joined { participant_id: Uuid },
     Error { message: String },

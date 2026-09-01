@@ -13,7 +13,10 @@ use wtransport::{
 };
 
 use crate::{
-    domain::room::{ClientMessage, ServerMessage},
+    domain::{
+        room::{ClientMessage, ServerMessage},
+        wire::{Encode, EncodeError, decode_exact},
+    },
     repository::room::{InsertHostError, InsertParticipantError},
     services::room::RoomService,
 };
@@ -201,7 +204,10 @@ fn parse_room_path(path: &str) -> Option<RoomRoute> {
     let host_token = Query::<RoomQuery>::try_from_uri(&uri)
         .ok()
         .and_then(|query| query.0.host_token);
-    Some(RoomRoute { room_id, host_token })
+    Some(RoomRoute {
+        room_id,
+        host_token,
+    })
 }
 
 async fn handle_bi_stream(
@@ -219,29 +225,37 @@ async fn handle_bi_stream(
 
     if buf.is_empty() {
         // Treat an empty request as a join (browser implementations differ).
-        send_message(
-            &mut send_stream,
-            &ServerMessage::Joined {
-                participant_id: *participant_id,
-            },
-        )
-        .await?;
+        let response = ServerMessage::Joined {
+            participant_id: *participant_id,
+        };
+        send_message(&mut send_stream, &response).await?;
         return Ok(());
     }
 
-    let msg: Result<ClientMessage, _> = serde_json::from_slice(&buf);
-    let response = match msg {
-        Ok(ClientMessage::Join) => ServerMessage::Joined {
+    let response = match decode_exact::<ClientMessage>(&buf) {
+        Ok(ClientMessage::Join) => Some(ServerMessage::Joined {
             participant_id: *participant_id,
-        },
-        Err(e) => ServerMessage::Error {
-            message: format!("invalid message: {e}"),
-        },
+        }),
+        Err(e) => {
+            // Unknown event IDs and malformed messages are ignored silently
+            // (no response is written) so that new client events can be
+            // rolled out independently.
+            warn!(participant_id = %participant_id, error = %e, "ignoring undecodable client message");
+            None
+        }
     };
 
-    let payload = send_message(&mut send_stream, &response).await?;
-
-    info!(participant_id = %participant_id, response = %payload, "responded to participant");
+    match response {
+        Some(response) => {
+            send_message(&mut send_stream, &response).await?;
+            info!(
+                participant_id = %participant_id,
+                response = ?response,
+                "responded to participant"
+            );
+        }
+        None => send_stream.finish().await?,
+    }
 
     Ok(())
 }
@@ -249,11 +263,12 @@ async fn handle_bi_stream(
 async fn send_message(
     send_stream: &mut wtransport::SendStream,
     msg: &ServerMessage,
-) -> Result<String, WebTransportError> {
-    let payload = serde_json::to_string(msg)?;
-    send_stream.write_all(payload.as_bytes()).await?;
+) -> Result<(), WebTransportError> {
+    let mut payload = Vec::new();
+    msg.encode(&mut payload)?;
+    send_stream.write_all(&payload).await?;
     send_stream.finish().await?;
-    Ok(payload)
+    Ok(())
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -264,8 +279,8 @@ pub enum WebTransportError {
     Io(#[from] io::Error),
     #[error("stream write error: {0}")]
     StreamWrite(#[from] StreamWriteError),
-    #[error("serialization error: {0}")]
-    Serialization(#[from] serde_json::Error),
+    #[error("encoding error: {0}")]
+    Encoding(#[from] EncodeError),
 }
 
 #[cfg(test)]
@@ -297,9 +312,8 @@ mod tests {
 
     fn setup_room_service(room_id: &str) -> (RoomRepository, RoomService) {
         let room_repo = RoomRepository::new();
-        let pool =
-            sqlx::MySqlPool::connect_lazy("mysql://root:password@127.0.0.1:3306/database")
-                .expect("lazy pool");
+        let pool = sqlx::MySqlPool::connect_lazy("mysql://root:password@127.0.0.1:3306/database")
+            .expect("lazy pool");
         let song_repo = SongRepository::new(pool);
         let song_service = SongService::new(song_repo);
         let room_service = RoomService::new(room_repo.clone(), song_service);
@@ -341,14 +355,16 @@ mod tests {
             .expect("open_bi")
             .await
             .expect("open_bi2");
-        let join_msg =
-            serde_json::to_vec(&ClientMessage::Join).expect("serialize join message");
+        let mut join_msg = Vec::new();
+        ClientMessage::Join
+            .encode(&mut join_msg)
+            .expect("encode join message");
         send.write_all(&join_msg).await.expect("write");
         send.finish().await.expect("finish");
 
         let mut buf = Vec::new();
         recv.read_to_end(&mut buf).await.expect("read_to_end");
-        match serde_json::from_slice::<ServerMessage>(&buf).expect("valid server message") {
+        match decode_exact::<ServerMessage>(&buf).expect("valid server message") {
             ServerMessage::Joined { participant_id } => participant_id,
             ServerMessage::Error { message } => panic!("unexpected error: {message}"),
         }
@@ -406,11 +422,45 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_webtransport_unknown_event_ignored() {
+        let room_id = "4444";
+        let (room_repo, room_service) = setup_room_service(room_id);
+
+        let (server_port, cert_hash) = start_server(room_service).await;
+        let client = test_client(cert_hash);
+
+        let connection = client
+            .connect(format!("https://127.0.0.1:{server_port}/rooms/{room_id}"))
+            .await
+            .expect("connect");
+
+        let (mut send, mut recv) = connection
+            .open_bi()
+            .await
+            .expect("open_bi")
+            .await
+            .expect("open_bi2");
+        send.write_all(&[0x02]).await.expect("write");
+        send.finish().await.expect("finish");
+
+        let mut buf = Vec::new();
+        recv.read_to_end(&mut buf).await.expect("read_to_end");
+        assert!(buf.is_empty(), "unknown event should get no response");
+
+        // The connection must remain usable after an ignored message.
+        let participant_id = join_as_participant(&connection).await;
+        assert!(!participant_id.to_string().is_empty());
+
+        sleep(Duration::from_millis(100)).await;
+        assert_eq!(room_repo.participant_count(room_id), Some(1));
+        connection.close(wtransport::VarInt::from_u32(0), b"done");
+    }
+
+    #[tokio::test]
     async fn test_webtransport_nonexistent_room_closed() {
         let room_repo = RoomRepository::new();
-        let pool =
-            sqlx::MySqlPool::connect_lazy("mysql://root:password@127.0.0.1:3306/database")
-                .expect("lazy pool");
+        let pool = sqlx::MySqlPool::connect_lazy("mysql://root:password@127.0.0.1:3306/database")
+            .expect("lazy pool");
         let song_repo = SongRepository::new(pool);
         let song_service = SongService::new(song_repo);
         let room_service = RoomService::new(room_repo, song_service);
