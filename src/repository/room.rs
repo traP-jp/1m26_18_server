@@ -5,6 +5,7 @@ use uuid::Uuid;
 
 use crate::domain::room::{
     CALIBRATION_SOUND_COUNT, DetectionError, DetectionOutcome, Host, Participant, Room,
+    ShakeOutcome,
 };
 
 #[derive(Clone, Default)]
@@ -241,6 +242,50 @@ impl RoomRepository {
         }
     }
 
+    /// Records one participant device-shake report. Reports are only
+    /// considered in sync-rate calculations for participants in the room
+    /// whose lag has been determined.
+    pub fn record_shake(
+        &self,
+        room_id: &str,
+        participant_id: Uuid,
+        detected_at: u64,
+    ) -> Result<(), ShakeError> {
+        let mut map = self.inner.write();
+        match map.get_mut(room_id) {
+            Some(room) => {
+                let live = room.live_mut().ok_or(ShakeError::NotLive)?;
+                match live.record_shake(participant_id, detected_at) {
+                    ShakeOutcome::Recorded => Ok(()),
+                    ShakeOutcome::UnknownParticipant => Err(ShakeError::ParticipantNotFound),
+                    ShakeOutcome::UnknownLag => Err(ShakeError::LagUnknown),
+                }
+            }
+            None => Err(ShakeError::RoomNotFound),
+        }
+    }
+
+    /// The room's overall sync rate (0-100) of the device shakes attributed
+    /// to the beat starting at `beat_at`, or `None` if no valid shake falls
+    /// within the beat's tolerance window. `None` is also returned when the
+    /// room does not exist or its live has not started.
+    pub fn sync_rate(&self, room_id: &str, beat_at: u64) -> Option<u8> {
+        match self.inner.read().get(room_id) {
+            Some(Room::Live(live)) => live.sync_rate(beat_at),
+            _ => None,
+        }
+    }
+
+    /// Absolute start times (unix microseconds) of the live's beats, used to
+    /// schedule per-beat sync-rate reports. `None` if the room does not exist
+    /// or its live has not started.
+    pub fn beat_schedule(&self, room_id: &str) -> Option<Vec<u64>> {
+        match self.inner.read().get(room_id) {
+            Some(Room::Live(live)) => Some(live.beat_schedule()),
+            _ => None,
+        }
+    }
+
     #[cfg(test)]
     pub fn participant_count(&self, room_id: &str) -> Option<usize> {
         self.inner
@@ -284,6 +329,14 @@ impl RoomRepository {
             .and_then(Room::participants)
             .and_then(|participants| participants.get(participant_id))
             .map(Participant::is_ready)
+    }
+
+    #[cfg(test)]
+    pub fn participant_shake_count(&self, room_id: &str, participant_id: &Uuid) -> Option<usize> {
+        match self.inner.read().get(room_id) {
+            Some(Room::Live(live)) => live.shake_count(participant_id),
+            _ => None,
+        }
     }
 }
 
@@ -337,4 +390,16 @@ pub enum CalibrationError {
     NoActiveCalibration,
     #[error("invalid sound detection: {0}")]
     Detection(#[from] DetectionError),
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum ShakeError {
+    #[error("room not found")]
+    RoomNotFound,
+    #[error("live has not started")]
+    NotLive,
+    #[error("participant not found")]
+    ParticipantNotFound,
+    #[error("participant lag is unknown")]
+    LagUnknown,
 }

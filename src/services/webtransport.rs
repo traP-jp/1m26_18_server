@@ -8,6 +8,7 @@ use std::{
 use axum::extract::Query;
 use serde::Deserialize;
 use tokio::io::AsyncReadExt;
+use tokio::time::sleep;
 use tracing::{Instrument, debug, info, warn};
 use uuid::Uuid;
 use wtransport::{
@@ -19,7 +20,7 @@ use wtransport::{
 
 use crate::{
     domain::{
-        room::{CALIBRATION_SOUND_COUNT, ClientMessage, ServerMessage},
+        room::{CALIBRATION_SOUND_COUNT, ClientMessage, SYNC_REPORT_DELAY_US, ServerMessage},
         wire::{Encode, EncodeError, decode_exact},
     },
     repository::room::{InsertHostError, InsertParticipantError},
@@ -166,7 +167,7 @@ impl WebTransportServer {
 
             info!(room_id = %room_id, host_id = %host_id, "host joined room");
 
-            handle_connection_streams(&room_service, &room_id, host_id, true, &connection).await;
+            run_connection_handlers(&room_service, &room_id, host_id, true, &connection).await;
 
             info!(room_id = %room_id, host_id = %host_id, "host disconnected, removing room");
             room_service.remove_room(&room_id);
@@ -204,8 +205,7 @@ impl WebTransportServer {
             ServerMessage::ParticipantJoined { participant_id },
         ));
 
-        handle_connection_streams(&room_service, &room_id, participant_id, false, &connection)
-            .await;
+        run_connection_handlers(&room_service, &room_id, participant_id, false, &connection).await;
 
         room_service.leave_room(&room_id, &participant_id);
     }
@@ -322,6 +322,75 @@ async fn handle_connection_streams(
     }
 }
 
+/// Serves a connection until it closes: bidirectional streams are handled
+/// inline, datagrams in a dedicated task. Shared by participants and the host.
+async fn run_connection_handlers(
+    room_service: &RoomService,
+    room_id: &str,
+    client_id: Uuid,
+    is_host: bool,
+    connection: &wtransport::Connection,
+) {
+    // Unreliable events travel as datagrams; they are served concurrently
+    // with the streams. The task ends on its own when the connection closes.
+    tokio::spawn(handle_datagrams(
+        room_service.clone(),
+        room_id.to_string(),
+        client_id,
+        is_host,
+        connection.clone(),
+    ));
+
+    handle_connection_streams(room_service, room_id, client_id, is_host, connection).await;
+}
+
+/// Receives datagrams until the connection closes. Only `Shake` reports are
+/// expected (and handled) on the unreliable channel; any other or malformed
+/// message is ignored.
+async fn handle_datagrams(
+    room_service: RoomService,
+    room_id: String,
+    client_id: Uuid,
+    is_host: bool,
+    connection: wtransport::Connection,
+) {
+    loop {
+        let datagram = match connection.receive_datagram().await {
+            Ok(datagram) => datagram,
+            Err(e) => {
+                debug!(
+                    room_id = %room_id,
+                    client_id = %client_id,
+                    error = %e,
+                    "datagram receive loop ended"
+                );
+                return;
+            }
+        };
+
+        match decode_exact::<ClientMessage>(&datagram.payload()) {
+            Ok(ClientMessage::Shake { detected_at }) => {
+                handle_shake(&room_service, &room_id, client_id, is_host, detected_at);
+            }
+            Ok(message) => {
+                debug!(
+                    room_id = %room_id,
+                    client_id = %client_id,
+                    message = ?message,
+                    "ignoring non-shake message on the datagram channel"
+                );
+            }
+            Err(e) => {
+                // Unknown event IDs and malformed messages are ignored
+                // silently (no response is possible on the unreliable
+                // channel) so that new client events can be rolled out
+                // independently.
+                warn!(client_id = %client_id, error = %e, "ignoring undecodable datagram");
+            }
+        }
+    }
+}
+
 struct RoomRoute {
     room_id: String,
     host_token: Option<String>,
@@ -428,6 +497,13 @@ async fn handle_bi_stream(
             // broadcasts the start time to every participant; it never
             // responds.
             handle_live_start(room_service, room_id, client_id, is_host, start_time);
+            None
+        }
+        Ok(ClientMessage::Shake { detected_at }) => {
+            // Shakes are expected on the unreliable datagram channel; for
+            // robustness a shake reported on a stream is recorded the same
+            // way. Fire-and-forget: no response is written.
+            handle_shake(room_service, room_id, client_id, is_host, detected_at);
             None
         }
         Err(e) => {
@@ -634,6 +710,114 @@ fn handle_live_start(
         room_id.to_string(),
         ServerMessage::LiveStarted { start_time },
     ));
+    // Fire-and-forget: per-beat sync-rate reports are unreliable and the
+    // loop ends after the song's last beat.
+    tokio::spawn(run_sync_rate_updates(
+        room_service.clone(),
+        room_id.to_string(),
+    ));
+}
+
+/// Records a participant's device-shake report (sent unreliably as a
+/// datagram) for per-beat sync-rate calculation. Reports from participants
+/// without a determined lag are excluded from the calculation.
+fn handle_shake(
+    room_service: &RoomService,
+    room_id: &str,
+    participant_id: Uuid,
+    is_host: bool,
+    detected_at: u64,
+) {
+    if is_host {
+        warn!(
+            room_id = %room_id,
+            host_id = %participant_id,
+            "ignoring device shake from the host"
+        );
+        return;
+    }
+    if let Err(e) = room_service.record_shake(room_id, &participant_id, detected_at) {
+        warn!(
+            room_id = %room_id,
+            participant_id = %participant_id,
+            error = %e,
+            "failed to record device shake"
+        );
+    }
+}
+
+/// Reports the room's sync rate to the host after each beat of the song, as
+/// an unreliable datagram. Beats without any valid shake are skipped; the
+/// loop ends after the song's last beat.
+async fn run_sync_rate_updates(room_service: RoomService, room_id: String) {
+    let Some(beat_times) = room_service.beat_schedule(&room_id) else {
+        debug!(
+            room_id = %room_id,
+            "room is not live, skipping sync-rate updates"
+        );
+        return;
+    };
+
+    for beat_at in beat_times {
+        // Wait until the beat's tolerance window has closed so that all
+        // shakes attributed to the beat (including late-arriving reports)
+        // are accounted for.
+        let report_at = beat_at.saturating_add(SYNC_REPORT_DELAY_US);
+        let now = unix_micros();
+        if report_at > now {
+            sleep(Duration::from_micros(report_at - now)).await;
+        }
+
+        let Some(rate) = room_service.sync_rate(&room_id, beat_at) else {
+            debug!(
+                room_id = %room_id,
+                beat_at,
+                "no valid shakes for beat, skipping sync-rate report"
+            );
+            continue;
+        };
+
+        send_datagram_to_host(&room_service, &room_id, &ServerMessage::SyncRate { rate });
+    }
+}
+
+/// Sends a server-initiated event to the room host as an unreliable
+/// datagram. Fire-and-forget: a missing host (e.g. the room was removed
+/// concurrently) or a transport failure (dropped datagrams are expected on
+/// the unreliable channel) is only logged.
+fn send_datagram_to_host(room_service: &RoomService, room_id: &str, message: &ServerMessage) {
+    let Some(connection) = room_service.host_connection(room_id) else {
+        debug!(
+            room_id = %room_id,
+            "host is not available, skipping datagram notification"
+        );
+        return;
+    };
+
+    let mut payload = Vec::new();
+    if let Err(e) = message.encode(&mut payload) {
+        warn!(
+            room_id = %room_id,
+            message = ?message,
+            error = %e,
+            "failed to encode datagram notification"
+        );
+        return;
+    }
+
+    match connection.send_datagram(payload) {
+        Ok(()) => {
+            info!(room_id = %room_id, message = ?message, "notified host via datagram");
+        }
+        Err(e) => {
+            warn!(
+                room_id = %room_id,
+                message = ?message,
+                error = %e,
+                "failed to send datagram to host"
+            );
+        }
+    }
 }
 
 /// Current wall-clock time in microseconds since the Unix epoch.
@@ -698,7 +882,31 @@ mod tests {
         .expect("valid dummy song JSON")
     }
 
+    fn song_with_beats(starts_at_ms: &[f32]) -> CompleteSongData {
+        serde_json::from_value(serde_json::json!({
+            "artist": "artist",
+            "durationMs": 10_000.0,
+            "beats": starts_at_ms
+                .iter()
+                .map(|&starts_at_ms| {
+                    serde_json::json!({"startsAtMs": starts_at_ms, "endsAtMs": starts_at_ms + 400.0})
+                })
+                .collect::<Vec<_>>(),
+            "phrases": [],
+            "segments": [{"isChorus": false, "startsAtMs": 0.0, "endsAtMs": 10_000.0}],
+            "title": "title"
+        }))
+        .expect("valid song JSON")
+    }
+
     fn setup_room_service(room_id: &str) -> (RoomRepository, RoomService) {
+        setup_room_service_with_song(room_id, dummy_complete_song())
+    }
+
+    fn setup_room_service_with_song(
+        room_id: &str,
+        song: CompleteSongData,
+    ) -> (RoomRepository, RoomService) {
         let room_repo = RoomRepository::new();
         let pool = sqlx::MySqlPool::connect_lazy("mysql://root:password@127.0.0.1:3306/database")
             .expect("lazy pool");
@@ -707,10 +915,7 @@ mod tests {
         let room_service = RoomService::new(room_repo.clone(), song_service);
         room_repo.insert(
             room_id.to_string(),
-            Room::Waiting(WaitingRoom::new(
-                dummy_complete_song(),
-                HOST_TOKEN.to_string(),
-            )),
+            Room::Waiting(WaitingRoom::new(song, HOST_TOKEN.to_string())),
         );
         (room_repo, room_service)
     }
@@ -771,6 +976,7 @@ mod tests {
             ServerMessage::LiveStarted { .. } => {
                 panic!("unexpected live started notification")
             }
+            ServerMessage::SyncRate { .. } => panic!("unexpected sync rate notification"),
         }
     }
 
@@ -807,6 +1013,24 @@ mod tests {
             .await
             .expect("read_to_end");
         decode_exact::<ServerMessage>(&buf).expect("valid server message")
+    }
+
+    /// Sends one client message as an unreliable datagram.
+    fn send_datagram(connection: &wtransport::Connection, message: &ClientMessage) {
+        let mut payload = Vec::new();
+        message
+            .encode(&mut payload)
+            .expect("encode datagram message");
+        connection.send_datagram(payload).expect("send datagram");
+    }
+
+    /// Receives one server-initiated datagram message.
+    async fn recv_datagram(connection: &wtransport::Connection) -> ServerMessage {
+        let datagram = connection
+            .receive_datagram()
+            .await
+            .expect("receive datagram");
+        decode_exact::<ServerMessage>(&datagram.payload()).expect("valid server datagram")
     }
 
     #[tokio::test]
@@ -2003,5 +2227,224 @@ mod tests {
             hex.chars()
                 .all(|c| c.is_ascii_digit() || ('a'..='f').contains(&c))
         );
+    }
+
+    /// Calibrates the participant against the host sound times with the
+    /// detections used by the calibration flow tests (median lag 60_000 µs).
+    async fn calibrate_participant(
+        host: &wtransport::Connection,
+        participant: &wtransport::Connection,
+    ) {
+        let host_times = [
+            1_700_000_000_000_000,
+            1_700_000_001_000_000,
+            1_700_000_002_000_000,
+        ];
+        send_client_message(host, &ClientMessage::CalibrationStart { times: host_times }).await;
+        let detections = [
+            (2, 1_700_000_002_000_000 + 70_000),
+            (0, 1_700_000_000_000_000 + 50_000),
+            (1, 1_700_000_001_000_000 + 60_000),
+        ];
+        for (sound_index, detected_at) in detections {
+            send_client_message(
+                participant,
+                &ClientMessage::CalibrationDetect {
+                    sound_index,
+                    detected_at,
+                },
+            )
+            .await;
+        }
+    }
+
+    #[tokio::test]
+    async fn test_webtransport_shake_reports_sync_rate_to_host() {
+        let room_id = "9797";
+        let (room_repo, room_service) =
+            setup_room_service_with_song(room_id, song_with_beats(&[0.0, 500.0]));
+
+        let (server_port, cert_hash) = start_server(room_service).await;
+        let client = test_client(cert_hash);
+
+        let host = client
+            .connect(format!(
+                "https://127.0.0.1:{server_port}/rooms/{room_id}?hostToken={HOST_TOKEN}"
+            ))
+            .await
+            .expect("connect as host");
+        sleep(Duration::from_millis(200)).await;
+
+        let participant = client
+            .connect(format!("https://127.0.0.1:{server_port}/rooms/{room_id}"))
+            .await
+            .expect("connect as participant");
+        let participant_id = join_as_participant(&participant).await;
+        calibrate_participant(&host, &participant).await;
+        assert_eq!(
+            room_repo.participant_lag(room_id, &participant_id),
+            Some(60_000)
+        );
+
+        // The host announces the live start; the participant shakes exactly
+        // on beat 0 (after lag correction).
+        let start_time = unix_micros() + 1_000_000;
+        let response = send_client_message(&host, &ClientMessage::LiveStart { start_time }).await;
+        assert!(response.is_empty());
+        send_datagram(
+            &participant,
+            &ClientMessage::Shake {
+                detected_at: start_time + 60_000,
+            },
+        );
+
+        sleep(Duration::from_millis(100)).await;
+        assert_eq!(
+            room_repo.participant_shake_count(room_id, &participant_id),
+            Some(1)
+        );
+
+        // The beat-0 report arrives on the datagram channel once the beat's
+        // tolerance window has closed.
+        let message = timeout(Duration::from_secs(5), recv_datagram(&host))
+            .await
+            .expect("sync-rate report for beat 0");
+        assert!(
+            matches!(message, ServerMessage::SyncRate { rate: 100 }),
+            "a shake exactly on the beat must score 100, got {message:?}"
+        );
+
+        // Beat 1 (at start + 500 ms) has no shakes: no report is sent for it.
+        let result = timeout(Duration::from_millis(800), recv_datagram(&host)).await;
+        assert!(result.is_err(), "beats without shakes must not be reported");
+
+        host.close(wtransport::VarInt::from_u32(0), b"done");
+        participant.close(wtransport::VarInt::from_u32(0), b"done");
+    }
+
+    #[tokio::test]
+    async fn test_webtransport_shake_without_lag_and_host_shake_ignored() {
+        let room_id = "9898";
+        let (room_repo, room_service) =
+            setup_room_service_with_song(room_id, song_with_beats(&[0.0, 500.0]));
+
+        let (server_port, cert_hash) = start_server(room_service).await;
+        let client = test_client(cert_hash);
+
+        let host = client
+            .connect(format!(
+                "https://127.0.0.1:{server_port}/rooms/{room_id}?hostToken={HOST_TOKEN}"
+            ))
+            .await
+            .expect("connect as host");
+        sleep(Duration::from_millis(200)).await;
+
+        let participant = client
+            .connect(format!("https://127.0.0.1:{server_port}/rooms/{room_id}"))
+            .await
+            .expect("connect as participant");
+        let participant_id = join_as_participant(&participant).await;
+
+        // No calibration: the participant's lag is unknown.
+
+        let start_time = unix_micros() + 1_000_000;
+        let response = send_client_message(&host, &ClientMessage::LiveStart { start_time }).await;
+        assert!(response.is_empty());
+
+        // The participant shakes exactly on beat 0, but its lag is unknown,
+        // so the report must be excluded (not even recorded).
+        send_datagram(
+            &participant,
+            &ClientMessage::Shake {
+                detected_at: start_time,
+            },
+        );
+        sleep(Duration::from_millis(100)).await;
+        assert_eq!(
+            room_repo.participant_shake_count(room_id, &participant_id),
+            None
+        );
+
+        // A shake sent by the host is ignored as well.
+        send_datagram(
+            &host,
+            &ClientMessage::Shake {
+                detected_at: start_time,
+            },
+        );
+
+        // No sync-rate report is sent for either beat.
+        let result = timeout(Duration::from_millis(1800), recv_datagram(&host)).await;
+        assert!(
+            result.is_err(),
+            "shakes of unknown-lag participants must not trigger reports"
+        );
+
+        host.close(wtransport::VarInt::from_u32(0), b"done");
+        participant.close(wtransport::VarInt::from_u32(0), b"done");
+    }
+
+    #[tokio::test]
+    async fn test_webtransport_shake_before_live_not_recorded() {
+        let room_id = "9998";
+        let (room_repo, room_service) =
+            setup_room_service_with_song(room_id, song_with_beats(&[0.0]));
+
+        let (server_port, cert_hash) = start_server(room_service).await;
+        let client = test_client(cert_hash);
+
+        let host = client
+            .connect(format!(
+                "https://127.0.0.1:{server_port}/rooms/{room_id}?hostToken={HOST_TOKEN}"
+            ))
+            .await
+            .expect("connect as host");
+        sleep(Duration::from_millis(200)).await;
+
+        let participant = client
+            .connect(format!("https://127.0.0.1:{server_port}/rooms/{room_id}"))
+            .await
+            .expect("connect as participant");
+        let participant_id = join_as_participant(&participant).await;
+        calibrate_participant(&host, &participant).await;
+        assert_eq!(
+            room_repo.participant_lag(room_id, &participant_id),
+            Some(60_000)
+        );
+
+        // A shake reported before the live starts is not recorded; its
+        // lag-corrected time is 80 ms off the beat (a score of 20 if it
+        // were).
+        let start_time = unix_micros() + 1_000_000;
+        send_datagram(
+            &participant,
+            &ClientMessage::Shake {
+                detected_at: start_time + 60_000 + 80_000,
+            },
+        );
+        sleep(Duration::from_millis(200)).await;
+
+        // After the live starts, a shake exactly on beat 0 must be the only
+        // one counted: the rate is 100, not the average with the pre-live
+        // shake.
+        let response = send_client_message(&host, &ClientMessage::LiveStart { start_time }).await;
+        assert!(response.is_empty());
+        send_datagram(
+            &participant,
+            &ClientMessage::Shake {
+                detected_at: start_time + 60_000,
+            },
+        );
+
+        let message = timeout(Duration::from_secs(5), recv_datagram(&host))
+            .await
+            .expect("sync-rate report for beat 0");
+        assert!(
+            matches!(message, ServerMessage::SyncRate { rate: 100 }),
+            "the pre-live shake must not be averaged into the beat's rate, got {message:?}"
+        );
+
+        host.close(wtransport::VarInt::from_u32(0), b"done");
+        participant.close(wtransport::VarInt::from_u32(0), b"done");
     }
 }

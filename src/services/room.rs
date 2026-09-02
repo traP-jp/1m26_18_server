@@ -5,7 +5,7 @@ use crate::domain::model::SongData;
 use crate::domain::room::{CALIBRATION_SOUND_COUNT, DetectionOutcome, Room, WaitingRoom};
 use crate::repository::room::{
     CalibrationError, InsertHostError, InsertParticipantError, RoomRepository, SetReadyError,
-    StartLiveError,
+    ShakeError, StartLiveError,
 };
 use crate::services::song::{SongService, SongServiceError};
 
@@ -185,6 +185,39 @@ impl RoomService {
             DetectionOutcome::AlreadyCompleted => {}
         }
         Ok(outcome)
+    }
+
+    /// Records one participant device-shake report (sent unreliably as a
+    /// datagram). Reports are only considered in sync-rate calculations for
+    /// participants in the room whose lag has been determined.
+    pub fn record_shake(
+        &self,
+        room_id: &str,
+        participant_id: &Uuid,
+        detected_at: u64,
+    ) -> Result<(), ShakeError> {
+        self.repo
+            .record_shake(room_id, *participant_id, detected_at)?;
+        tracing::debug!(
+            room_id = %room_id,
+            participant_id = %participant_id,
+            detected_at,
+            "participant device shake recorded"
+        );
+        Ok(())
+    }
+
+    /// The room's overall sync rate (0-100) of the device shakes attributed
+    /// to the beat starting at `beat_at`, or `None` if no valid shake falls
+    /// within the beat's tolerance window.
+    pub fn sync_rate(&self, room_id: &str, beat_at: u64) -> Option<u8> {
+        self.repo.sync_rate(room_id, beat_at)
+    }
+
+    /// Absolute start times (unix microseconds) of the live's beats, used to
+    /// schedule per-beat sync-rate reports.
+    pub fn beat_schedule(&self, room_id: &str) -> Option<Vec<u64>> {
+        self.repo.beat_schedule(room_id)
     }
 }
 

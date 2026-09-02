@@ -37,6 +37,11 @@ impl CompleteSongData {
             title,
         }
     }
+
+    /// The song's beats (each one's start/end position in milliseconds).
+    pub fn beats(&self) -> &Vec<Beat> {
+        &self.beats
+    }
 }
 
 #[derive(Deserialize, Serialize, ToSchema)]
@@ -72,6 +77,13 @@ impl IncompleteSongData {
 pub struct Beat {
     starts_at_ms: f32,
     ends_at_ms: f32,
+}
+
+impl Beat {
+    /// The beat's start position in the song, in milliseconds.
+    pub fn starts_at_ms(&self) -> f32 {
+        self.starts_at_ms
+    }
 }
 
 #[derive(Clone, Deserialize, Serialize, ToSchema)]

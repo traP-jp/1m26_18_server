@@ -34,6 +34,7 @@
 //! | 0x06 | C -> S    | Stamp              | u8 stamp id                        |
 //! | 0x07 | C -> S    | LiveStart          | u64 (unix µs, live start time)     |
 //! | 0x08 | C -> S    | ColorChange        | u8 color id                        |
+//! | 0x09 | C -> S    | Shake              | u64 (unix µs, device shake time)   |
 //! | 0x81 | S -> C    | Joined             | 16-byte UUID (participant id)      |
 //! | 0x83 | S -> C    | TimeSyncResponse   | u64 t1 + u64 t2 (unix µs)          |
 //! | 0x82 | S -> C    | Error              | u16 length + UTF-8 message         |
@@ -42,12 +43,16 @@
 //! | 0x86 | S -> C    | ParticipantStamp   | 16-byte UUID (participant id) + u8 stamp id |
 //! | 0x87 | S -> C    | LiveStarted        | u64 (unix µs, live start time)     |
 //! | 0x88 | S -> C    | ParticipantColorChange | 16-byte UUID (participant id) + u8 color id |
+//! | 0x89 | S -> C    | SyncRate           | u8 (sync rate 0-100)               |
 //!
 //! `Joined` and `TimeSyncResponse` are responses written on the
 //! client-initiated stream that carried the request; `ParticipantJoined`,
 //! `ParticipantReady`, `ParticipantStamp`, `LiveStarted` and
 //! `ParticipantColorChange` are pushed by the server on a server-initiated
-//! bidirectional stream (clients must accept incoming streams).
+//! bidirectional stream (clients must accept incoming streams). `Shake` is
+//! sent by clients as an unreliable WebTransport datagram and `SyncRate` is
+//! pushed by the server as a datagram; each datagram carries exactly one
+//! message.
 
 use std::str::from_utf8;
 
@@ -71,6 +76,8 @@ pub const EVENT_STAMP: u8 = 0x06;
 pub const EVENT_LIVE_START: u8 = 0x07;
 /// Event ID of [`ClientMessage::ColorChange`].
 pub const EVENT_COLOR_CHANGE: u8 = 0x08;
+/// Event ID of [`ClientMessage::Shake`].
+pub const EVENT_SHAKE: u8 = 0x09;
 /// Event ID of [`ServerMessage::Joined`].
 pub const EVENT_JOINED: u8 = 0x81;
 /// Event ID of [`ServerMessage::TimeSyncResponse`].
@@ -87,6 +94,8 @@ pub const EVENT_PARTICIPANT_STAMP: u8 = 0x86;
 pub const EVENT_LIVE_STARTED: u8 = 0x87;
 /// Event ID of [`ServerMessage::ParticipantColorChange`].
 pub const EVENT_PARTICIPANT_COLOR_CHANGE: u8 = 0x88;
+/// Event ID of [`ServerMessage::SyncRate`].
+pub const EVENT_SYNC_RATE: u8 = 0x89;
 
 #[derive(Debug, thiserror::Error)]
 pub enum EncodeError {
@@ -275,6 +284,10 @@ impl Encode for ClientMessage {
                 EVENT_LIVE_START.encode(buf)?;
                 start_time.encode(buf)
             }
+            ClientMessage::Shake { detected_at } => {
+                EVENT_SHAKE.encode(buf)?;
+                detected_at.encode(buf)
+            }
         }
     }
 }
@@ -300,6 +313,9 @@ impl Decode for ClientMessage {
             }),
             EVENT_LIVE_START => Ok(ClientMessage::LiveStart {
                 start_time: u64::decode(buf)?,
+            }),
+            EVENT_SHAKE => Ok(ClientMessage::Shake {
+                detected_at: u64::decode(buf)?,
             }),
             id => Err(DecodeError::UnknownEventId(id)),
         }
@@ -350,6 +366,10 @@ impl Encode for ServerMessage {
                 EVENT_LIVE_STARTED.encode(buf)?;
                 start_time.encode(buf)
             }
+            ServerMessage::SyncRate { rate } => {
+                EVENT_SYNC_RATE.encode(buf)?;
+                rate.encode(buf)
+            }
         }
     }
 }
@@ -383,6 +403,9 @@ impl Decode for ServerMessage {
             }),
             EVENT_LIVE_STARTED => Ok(ServerMessage::LiveStarted {
                 start_time: u64::decode(buf)?,
+            }),
+            EVENT_SYNC_RATE => Ok(ServerMessage::SyncRate {
+                rate: u8::decode(buf)?,
             }),
             id => Err(DecodeError::UnknownEventId(id)),
         }
@@ -565,6 +588,37 @@ mod tests {
     }
 
     #[test]
+    fn shake_roundtrip() {
+        let mut buf = Vec::new();
+        ClientMessage::Shake {
+            detected_at: 1_700_000_000_012_345,
+        }
+        .encode(&mut buf)
+        .expect("encode shake");
+        assert_eq!(buf[0], EVENT_SHAKE);
+        assert_eq!(buf.len(), 9);
+        match decode_exact::<ClientMessage>(&buf).expect("decode shake") {
+            ClientMessage::Shake { detected_at } => {
+                assert_eq!(detected_at, 1_700_000_000_012_345);
+            }
+            other => panic!("unexpected message: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn sync_rate_roundtrip() {
+        let mut buf = Vec::new();
+        ServerMessage::SyncRate { rate: 87 }
+            .encode(&mut buf)
+            .expect("encode sync rate");
+        assert_eq!(buf, [EVENT_SYNC_RATE, 87]);
+        match decode_exact::<ServerMessage>(&buf).expect("decode sync rate") {
+            ServerMessage::SyncRate { rate } => assert_eq!(rate, 87),
+            other => panic!("unexpected message: {other:?}"),
+        }
+    }
+
+    #[test]
     fn error_roundtrip() {
         let mut buf = Vec::new();
         ServerMessage::Error {
@@ -681,6 +735,17 @@ mod tests {
             decode_exact::<ClientMessage>(&[EVENT_CALIBRATION_DETECT]),
             Err(DecodeError::UnexpectedEof)
         ));
+        // A shake is an 8-byte timestamp.
+        assert!(matches!(
+            decode_exact::<ClientMessage>(&[EVENT_SHAKE]),
+            Err(DecodeError::UnexpectedEof)
+        ));
+        let mut buf = vec![EVENT_SHAKE];
+        buf.extend_from_slice(&[0u8; 7]);
+        assert!(matches!(
+            decode_exact::<ClientMessage>(&buf),
+            Err(DecodeError::UnexpectedEof)
+        ));
     }
 
     #[test]
@@ -704,6 +769,18 @@ mod tests {
         }
         .encode(&mut buf)
         .expect("encode calibration detect");
+        buf.push(0x00);
+        assert!(matches!(
+            decode_exact::<ClientMessage>(&buf),
+            Err(DecodeError::TrailingBytes)
+        ));
+
+        let mut buf = Vec::new();
+        ClientMessage::Shake {
+            detected_at: 1_700_000_000_000_000,
+        }
+        .encode(&mut buf)
+        .expect("encode shake");
         buf.push(0x00);
         assert!(matches!(
             decode_exact::<ClientMessage>(&buf),
@@ -763,6 +840,10 @@ mod tests {
         buf.extend_from_slice(&[0u8; 15]);
         assert!(matches!(
             decode_exact::<ServerMessage>(&buf),
+            Err(DecodeError::UnexpectedEof)
+        ));
+        assert!(matches!(
+            decode_exact::<ServerMessage>(&[EVENT_SYNC_RATE]),
             Err(DecodeError::UnexpectedEof)
         ));
     }
