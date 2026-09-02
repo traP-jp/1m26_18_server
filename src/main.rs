@@ -7,7 +7,7 @@ use om26_18::{
     services::{
         room::RoomService,
         song::SongService,
-        webtransport::{WebTransportError, WebTransportServer},
+        webtransport::{WebTransportError, WebTransportServer, certificate_hash_hex},
     },
 };
 use sqlx::{migrate::MigrateError, mysql::MySqlPoolOptions};
@@ -46,16 +46,21 @@ async fn main() -> Result<(), AppError> {
     let song_service = SongService::new(repo);
     let room_repo = RoomRepository::new();
     let room_service = RoomService::new(room_repo, song_service.clone());
-    let state = AppState {
-        song_service,
-        room_service: room_service.clone(),
-    };
 
     let wt_port: u16 = env::var("WEBTRANSPORT_PORT")
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or(4433);
-    let (wt_server, _cert_hash) = WebTransportServer::new(room_service, wt_port)?;
+    let (wt_server, cert_hash) = WebTransportServer::new(room_service.clone(), wt_port)?;
+    let wt_local_port = wt_server.local_addr()?.port();
+
+    let state = AppState {
+        song_service,
+        room_service,
+        webtransport_cert_hash: certificate_hash_hex(&cert_hash),
+        webtransport_port: wt_local_port,
+    };
+
     tokio::spawn(async move {
         if let Err(e) = wt_server.serve().await {
             tracing::error!(error = %e, "WebTransport server error");

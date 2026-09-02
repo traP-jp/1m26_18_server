@@ -1,5 +1,6 @@
 pub mod room;
 pub mod song;
+pub mod webtransport;
 
 use std::io::Result;
 
@@ -19,6 +20,10 @@ use crate::services::song::SongService;
 pub struct AppState {
     pub song_service: SongService,
     pub room_service: RoomService,
+    /// SHA-256 digest (lowercase hex) of the self-signed WebTransport certificate.
+    pub webtransport_cert_hash: String,
+    /// UDP port the WebTransport server listens on.
+    pub webtransport_port: u16,
 }
 
 const API_ROOT: &str = "/api/v1";
@@ -44,6 +49,7 @@ pub fn setup_openapi_routes() -> (Router<AppState>, OpenApi) {
             song::create_song
         ))
         .routes(utoipa_axum::routes!(room::create_room))
+        .routes(utoipa_axum::routes!(webtransport::get_certificate_hash))
         .split_for_parts()
 }
 

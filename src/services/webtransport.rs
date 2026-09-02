@@ -36,6 +36,17 @@ static ROOM_ROUTER: LazyLock<matchit::Router<()>> = LazyLock::new(|| {
     router
 });
 
+/// Formats a certificate SHA-256 digest as a lowercase hex string (64 chars),
+/// ready to be decoded by clients into the raw 32 bytes required by the
+/// browser's `serverCertificateHashes`.
+pub fn certificate_hash_hex(digest: &Sha256Digest) -> String {
+    digest
+        .as_ref()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
 pub struct WebTransportServer {
     endpoint: Endpoint<Server>,
     room_service: RoomService,
@@ -1501,5 +1512,25 @@ mod tests {
 
         host.close(wtransport::VarInt::from_u32(0), b"done");
         participant.close(wtransport::VarInt::from_u32(0), b"done");
+    }
+
+    #[test]
+    fn test_certificate_hash_hex() {
+        let bytes = [
+            0x00, 0x0f, 0xa5, 0xff, 0x12, 0x34, 0x56, 0x78, 0x9a, 0xbc, 0xde, 0xf0, 0x01, 0x23,
+            0x45, 0x67, 0x89, 0xab, 0xcd, 0xef, 0xfe, 0xdc, 0xba, 0x98, 0x76, 0x54, 0x32, 0x10,
+            0xca, 0xfe, 0xba, 0xbe,
+        ];
+        let digest = Sha256Digest::new(bytes);
+        let hex = certificate_hash_hex(&digest);
+        assert_eq!(hex.len(), 64);
+        assert_eq!(
+            hex,
+            "000fa5ff123456789abcdef00123456789abcdeffedcba9876543210cafebabe"
+        );
+        assert!(
+            hex.chars()
+                .all(|c| c.is_ascii_digit() || ('a'..='f').contains(&c))
+        );
     }
 }
