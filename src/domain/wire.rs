@@ -33,6 +33,12 @@
 //! | 0x81 | S -> C    | Joined             | 16-byte UUID (participant id)      |
 //! | 0x83 | S -> C    | TimeSyncResponse   | u64 t1 + u64 t2 (unix µs)          |
 //! | 0x82 | S -> C    | Error              | u16 length + UTF-8 message         |
+//! | 0x84 | S -> C    | ParticipantJoined  | 16-byte UUID (participant id)      |
+//!
+//! `Joined` and `TimeSyncResponse` are responses written on the
+//! client-initiated stream that carried the request; `ParticipantJoined` is
+//! pushed by the server on a server-initiated bidirectional stream (host
+//! clients must accept incoming streams).
 
 use std::str::from_utf8;
 
@@ -54,6 +60,8 @@ pub const EVENT_JOINED: u8 = 0x81;
 pub const EVENT_TIME_SYNC_RESPONSE: u8 = 0x83;
 /// Event ID of [`ServerMessage::Error`].
 pub const EVENT_ERROR: u8 = 0x82;
+/// Event ID of [`ServerMessage::ParticipantJoined`].
+pub const EVENT_PARTICIPANT_JOINED: u8 = 0x84;
 
 #[derive(Debug, thiserror::Error)]
 pub enum EncodeError {
@@ -266,6 +274,10 @@ impl Encode for ServerMessage {
                 EVENT_ERROR.encode(buf)?;
                 message.encode(buf)
             }
+            ServerMessage::ParticipantJoined { participant_id } => {
+                EVENT_PARTICIPANT_JOINED.encode(buf)?;
+                participant_id.encode(buf)
+            }
         }
     }
 }
@@ -282,6 +294,9 @@ impl Decode for ServerMessage {
             }),
             EVENT_ERROR => Ok(ServerMessage::Error {
                 message: String::decode(buf)?,
+            }),
+            EVENT_PARTICIPANT_JOINED => Ok(ServerMessage::ParticipantJoined {
+                participant_id: Uuid::decode(buf)?,
             }),
             id => Err(DecodeError::UnknownEventId(id)),
         }
@@ -314,6 +329,21 @@ mod tests {
         assert_eq!(buf.len(), 17);
         match decode_exact::<ServerMessage>(&buf).expect("decode joined") {
             ServerMessage::Joined { participant_id } => assert_eq!(participant_id, id),
+            other => panic!("unexpected message: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn participant_joined_roundtrip() {
+        let id = Uuid::now_v7();
+        let mut buf = Vec::new();
+        ServerMessage::ParticipantJoined { participant_id: id }
+            .encode(&mut buf)
+            .expect("encode participant joined");
+        assert_eq!(buf[0], EVENT_PARTICIPANT_JOINED);
+        assert_eq!(buf.len(), 17);
+        match decode_exact::<ServerMessage>(&buf).expect("decode participant joined") {
+            ServerMessage::ParticipantJoined { participant_id } => assert_eq!(participant_id, id),
             other => panic!("unexpected message: {other:?}"),
         }
     }
@@ -512,6 +542,12 @@ mod tests {
             Err(DecodeError::TrailingBytes)
         ));
         buf = vec![EVENT_JOINED];
+        buf.extend_from_slice(&[0u8; 15]);
+        assert!(matches!(
+            decode_exact::<ServerMessage>(&buf),
+            Err(DecodeError::UnexpectedEof)
+        ));
+        buf = vec![EVENT_PARTICIPANT_JOINED];
         buf.extend_from_slice(&[0u8; 15]);
         assert!(matches!(
             decode_exact::<ServerMessage>(&buf),

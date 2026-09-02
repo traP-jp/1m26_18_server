@@ -277,9 +277,21 @@ pub enum ClientMessage {
 /// The wire encoding is defined in [`crate::domain::wire`].
 #[derive(Debug)]
 pub enum ServerMessage {
-    Joined { participant_id: Uuid },
-    TimeSyncResponse { t1: u64, t2: u64 },
-    Error { message: String },
+    Joined {
+        participant_id: Uuid,
+    },
+    TimeSyncResponse {
+        t1: u64,
+        t2: u64,
+    },
+    Error {
+        message: String,
+    },
+    /// Host only: a participant joined the room. Sent on a server-initiated
+    /// bidirectional stream.
+    ParticipantJoined {
+        participant_id: Uuid,
+    },
 }
 
 #[cfg(test)]

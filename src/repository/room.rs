@@ -93,6 +93,15 @@ impl RoomRepository {
         Ok(())
     }
 
+    /// Returns a clone of the room host's connection. `None` if the room does
+    /// not exist or the host has not joined yet.
+    pub fn host_connection(&self, room_id: &str) -> Option<wtransport::Connection> {
+        match self.inner.read().get(room_id) {
+            Some(Room::HostJoined(joined)) => Some(joined.host().connection().clone()),
+            _ => None,
+        }
+    }
+
     /// Removes and returns the room. Returns `None` if the room does not exist.
     pub fn remove_room(&self, room_id: &str) -> Option<Room> {
         self.inner.write().remove(room_id)

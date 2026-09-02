@@ -83,6 +83,11 @@ impl RoomService {
         Ok(host_id)
     }
 
+    /// Returns a clone of the room host's connection, if the host has joined.
+    pub fn host_connection(&self, room_id: &str) -> Option<wtransport::Connection> {
+        self.repo.host_connection(room_id)
+    }
+
     /// Removes the room and closes all remaining participant connections (host disconnected).
     pub fn remove_room(&self, room_id: &str) {
         if let Some(room) = self.repo.remove_room(room_id) {

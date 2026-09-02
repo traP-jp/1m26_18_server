@@ -8,12 +8,12 @@ use std::{
 use axum::extract::Query;
 use serde::Deserialize;
 use tokio::io::AsyncReadExt;
-use tracing::{Instrument, info, warn};
+use tracing::{Instrument, debug, info, warn};
 use uuid::Uuid;
 use wtransport::{
     Endpoint, Identity, ServerConfig,
     endpoint::{IncomingSession, endpoint_side::Server},
-    error::StreamWriteError,
+    error::{ConnectionError, StreamOpeningError, StreamWriteError},
     tls::{Sha256Digest, error::InvalidSan},
 };
 
@@ -171,10 +171,51 @@ impl WebTransportServer {
 
         info!(room_id = %room_id, participant_id = %participant_id, "participant joined");
 
+        // Fire-and-forget: the join flow must not block on (or fail with) the
+        // host notification.
+        tokio::spawn(notify_host_participant_joined(
+            room_service.clone(),
+            room_id.clone(),
+            participant_id,
+        ));
+
         handle_connection_streams(&room_service, &room_id, participant_id, false, &connection)
             .await;
 
         room_service.leave_room(&room_id, &participant_id);
+    }
+}
+
+/// Notifies the room host that a participant joined, on a server-initiated
+/// bidirectional stream.
+///
+/// Fire-and-forget: a missing host (room still waiting for its host) skips
+/// the notification, and any transport failure is only logged.
+async fn notify_host_participant_joined(
+    room_service: RoomService,
+    room_id: String,
+    participant_id: Uuid,
+) {
+    let Some(connection) = room_service.host_connection(&room_id) else {
+        debug!(room_id = %room_id, "host has not joined yet, skipping join notification");
+        return;
+    };
+
+    let message = ServerMessage::ParticipantJoined { participant_id };
+
+    let result = async {
+        let (mut send_stream, _recv_stream) = connection.open_bi().await?.await?;
+        send_message(&mut send_stream, &message).await
+    }
+    .await;
+
+    match result {
+        Ok(()) => {
+            info!(room_id = %room_id, participant_id = %participant_id, "notified host of participant join");
+        }
+        Err(e) => {
+            warn!(room_id = %room_id, participant_id = %participant_id, error = %e, "failed to notify host of participant join");
+        }
     }
 }
 
@@ -396,6 +437,10 @@ pub enum WebTransportError {
     InvalidSan(#[from] InvalidSan),
     #[error("IO error: {0}")]
     Io(#[from] io::Error),
+    #[error("connection error: {0}")]
+    Connection(#[from] ConnectionError),
+    #[error("stream opening error: {0}")]
+    StreamOpening(#[from] StreamOpeningError),
     #[error("stream write error: {0}")]
     StreamWrite(#[from] StreamWriteError),
     #[error("encoding error: {0}")]
@@ -487,6 +532,9 @@ mod tests {
             ServerMessage::Joined { participant_id } => participant_id,
             ServerMessage::TimeSyncResponse { .. } => panic!("unexpected time sync response"),
             ServerMessage::Error { message } => panic!("unexpected error: {message}"),
+            ServerMessage::ParticipantJoined { .. } => {
+                panic!("unexpected participant joined notification")
+            }
         }
     }
 
@@ -1114,5 +1162,50 @@ mod tests {
             room_repo.exists(room_id),
             "room should survive a participant disconnect"
         );
+    }
+
+    #[tokio::test]
+    async fn test_webtransport_notify_host_on_participant_join() {
+        let room_id = "9090";
+        let (_room_repo, room_service) = setup_room_service(room_id);
+
+        let (server_port, cert_hash) = start_server(room_service).await;
+        let client = test_client(cert_hash);
+
+        let host = client
+            .connect(format!(
+                "https://127.0.0.1:{server_port}/rooms/{room_id}?hostToken={HOST_TOKEN}"
+            ))
+            .await
+            .expect("connect as host");
+
+        let participant = client
+            .connect(format!("https://127.0.0.1:{server_port}/rooms/{room_id}"))
+            .await
+            .expect("connect as participant");
+        let participant_id = join_as_participant(&participant).await;
+
+        // The notification arrives on a server-initiated bidirectional stream.
+        let (_send_stream, mut recv_stream) = host
+            .accept_bi()
+            .await
+            .expect("host accepts server-initiated stream");
+
+        let mut buf = Vec::new();
+        recv_stream
+            .read_to_end(&mut buf)
+            .await
+            .expect("read_to_end");
+        match decode_exact::<ServerMessage>(&buf).expect("valid server message") {
+            ServerMessage::ParticipantJoined {
+                participant_id: notified,
+            } => {
+                assert_eq!(notified, participant_id);
+            }
+            other => panic!("unexpected message: {other:?}"),
+        }
+
+        host.close(wtransport::VarInt::from_u32(0), b"done");
+        participant.close(wtransport::VarInt::from_u32(0), b"done");
     }
 }
