@@ -125,6 +125,10 @@ impl WebTransportServer {
             warn!(room_id = %room_id, "room not found");
             session_request.not_found().await;
             return;
+        } else if !room_service.host_joined(&room_id) {
+            warn!(room_id = %room_id, "participant session rejected: host has not joined");
+            session_request.forbidden().await;
+            return;
         }
 
         let connection = match session_request.accept().await {
@@ -167,6 +171,11 @@ impl WebTransportServer {
                 connection.close(wtransport::VarInt::from_u32(404), b"room not found");
                 return;
             }
+            Err(InsertParticipantError::HostNotJoined) => {
+                warn!(room_id = %room_id, "host has not joined after accept, closing connection");
+                connection.close(wtransport::VarInt::from_u32(403), b"host has not joined");
+                return;
+            }
         };
 
         info!(room_id = %room_id, participant_id = %participant_id, "participant joined");
@@ -189,8 +198,8 @@ impl WebTransportServer {
 /// Notifies the room host that a participant joined, on a server-initiated
 /// bidirectional stream.
 ///
-/// Fire-and-forget: a missing host (room still waiting for its host) skips
-/// the notification, and any transport failure is only logged.
+/// Fire-and-forget: a missing host (e.g. the room was removed concurrently)
+/// skips the notification, and any transport failure is only logged.
 async fn notify_host_participant_joined(
     room_service: RoomService,
     room_id: String,
@@ -588,26 +597,23 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_webtransport_join_flow() {
+    async fn test_webtransport_participant_rejected_before_host_join() {
         let room_id = "9999";
         let (room_repo, room_service) = setup_room_service(room_id);
 
         let (server_port, cert_hash) = start_server(room_service).await;
         let client = test_client(cert_hash);
 
-        let connection = client
+        // The host has not joined yet: the participant session must be rejected.
+        let result = client
             .connect(format!("https://127.0.0.1:{server_port}/rooms/{room_id}"))
-            .await
-            .expect("connect");
-
-        let participant_id = join_as_participant(&connection).await;
-        assert!(!participant_id.to_string().is_empty());
-
-        sleep(Duration::from_millis(100)).await;
-        assert_eq!(room_repo.participant_count(room_id), Some(1));
-        connection.close(wtransport::VarInt::from_u32(0), b"done");
-        sleep(Duration::from_millis(300)).await;
-        assert_eq!(room_repo.participant_count(room_id), Some(0));
+            .await;
+        assert!(
+            result.is_err(),
+            "expected connect to fail while the host has not joined"
+        );
+        assert!(room_repo.exists(room_id));
+        assert!(room_repo.host_id(room_id).is_none());
     }
 
     #[tokio::test]
@@ -617,6 +623,14 @@ mod tests {
 
         let (server_port, cert_hash) = start_server(room_service).await;
         let client = test_client(cert_hash);
+
+        let host = client
+            .connect(format!(
+                "https://127.0.0.1:{server_port}/rooms/{room_id}?hostToken={HOST_TOKEN}"
+            ))
+            .await
+            .expect("connect as host");
+        sleep(Duration::from_millis(200)).await;
 
         let connection = client
             .connect(format!("https://127.0.0.1:{server_port}/rooms/{room_id}"))
@@ -659,6 +673,7 @@ mod tests {
         connection.close(wtransport::VarInt::from_u32(0), b"done");
         sleep(Duration::from_millis(300)).await;
         assert_eq!(room_repo.participant_count(room_id), Some(0));
+        host.close(wtransport::VarInt::from_u32(0), b"done");
     }
 
     #[tokio::test]
@@ -675,6 +690,7 @@ mod tests {
             ))
             .await
             .expect("connect as host");
+        sleep(Duration::from_millis(200)).await;
         let participant = client
             .connect(format!("https://127.0.0.1:{server_port}/rooms/{room_id}"))
             .await
@@ -742,6 +758,7 @@ mod tests {
             ))
             .await
             .expect("connect as host");
+        sleep(Duration::from_millis(200)).await;
         let participant = client
             .connect(format!("https://127.0.0.1:{server_port}/rooms/{room_id}"))
             .await
@@ -879,6 +896,7 @@ mod tests {
             ))
             .await
             .expect("connect as host");
+        sleep(Duration::from_millis(200)).await;
         let participant = client
             .connect(format!("https://127.0.0.1:{server_port}/rooms/{room_id}"))
             .await
@@ -999,6 +1017,14 @@ mod tests {
         let (server_port, cert_hash) = start_server(room_service).await;
         let client = test_client(cert_hash);
 
+        let host = client
+            .connect(format!(
+                "https://127.0.0.1:{server_port}/rooms/{room_id}?hostToken={HOST_TOKEN}"
+            ))
+            .await
+            .expect("connect as host");
+        sleep(Duration::from_millis(200)).await;
+
         let connection = client
             .connect(format!("https://127.0.0.1:{server_port}/rooms/{room_id}"))
             .await
@@ -1025,6 +1051,7 @@ mod tests {
         sleep(Duration::from_millis(100)).await;
         assert_eq!(room_repo.participant_count(room_id), Some(1));
         connection.close(wtransport::VarInt::from_u32(0), b"done");
+        host.close(wtransport::VarInt::from_u32(0), b"done");
     }
 
     #[tokio::test]
@@ -1178,6 +1205,7 @@ mod tests {
             ))
             .await
             .expect("connect as host");
+        sleep(Duration::from_millis(200)).await;
 
         let participant = client
             .connect(format!("https://127.0.0.1:{server_port}/rooms/{room_id}"))

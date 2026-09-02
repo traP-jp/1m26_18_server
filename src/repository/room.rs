@@ -25,7 +25,14 @@ impl RoomRepository {
         self.inner.write().insert(room_id, room);
     }
 
-    /// Registers a participant in the room. Returns an error if the room does not exist.
+    /// Returns whether the room's host has joined. Participants may join a
+    /// room only after its host.
+    pub fn host_joined(&self, room_id: &str) -> bool {
+        matches!(self.inner.read().get(room_id), Some(Room::HostJoined(_)))
+    }
+
+    /// Registers a participant in the room. Returns an error if the room does
+    /// not exist or its host has not joined yet.
     pub fn insert_participant(
         &self,
         room_id: &str,
@@ -34,10 +41,13 @@ impl RoomRepository {
     ) -> Result<(), InsertParticipantError> {
         let mut map = self.inner.write();
         match map.get_mut(room_id) {
-            Some(room) => {
-                room.participants_mut().insert(participant_id, connection);
-                Ok(())
-            }
+            Some(room) => match room.participants_mut() {
+                Some(participants) => {
+                    participants.insert(participant_id, connection);
+                    Ok(())
+                }
+                None => Err(InsertParticipantError::HostNotJoined),
+            },
             None => Err(InsertParticipantError::RoomNotFound),
         }
     }
@@ -45,8 +55,10 @@ impl RoomRepository {
     /// Removes a participant from the room. Does nothing if the room or participant does not exist.
     pub fn remove_participant(&self, room_id: &str, participant_id: &Uuid) {
         let mut map = self.inner.write();
-        if let Some(room) = map.get_mut(room_id) {
-            room.participants_mut().remove(participant_id);
+        if let Some(room) = map.get_mut(room_id)
+            && let Some(participants) = room.participants_mut()
+        {
+            participants.remove(participant_id);
         }
     }
 
@@ -88,7 +100,7 @@ impl RoomRepository {
         }
         map.insert(
             room_id.to_string(),
-            Room::HostJoined(waiting.join_host(Host::new(host_id, connection))),
+            Room::HostJoined(Box::new(waiting.join_host(Host::new(host_id, connection)))),
         );
         Ok(())
     }
@@ -165,7 +177,7 @@ impl RoomRepository {
         self.inner
             .read()
             .get(room_id)
-            .map(Room::participants)
+            .and_then(Room::participants)
             .map(HashMap::len)
     }
 
@@ -190,6 +202,8 @@ impl RoomRepository {
 pub enum InsertParticipantError {
     #[error("room not found")]
     RoomNotFound,
+    #[error("host has not joined yet")]
+    HostNotJoined,
 }
 
 #[derive(Debug, thiserror::Error)]

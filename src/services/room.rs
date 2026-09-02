@@ -43,6 +43,7 @@ impl RoomService {
     }
 
     /// Assigns a unique participant ID and registers the connection in the room.
+    /// Fails if the room does not exist or its host has not joined yet.
     pub fn join_room(
         &self,
         room_id: &str,
@@ -68,6 +69,12 @@ impl RoomService {
         self.repo.validate_host_token(room_id, token)
     }
 
+    /// Returns whether the room's host has joined. Participants may join a
+    /// room only after its host.
+    pub fn host_joined(&self, room_id: &str) -> bool {
+        self.repo.host_joined(room_id)
+    }
+
     /// Validates the host token and registers the connection as the room's host.
     pub fn join_room_as_host(
         &self,
@@ -91,9 +98,11 @@ impl RoomService {
     /// Removes the room and closes all remaining participant connections (host disconnected).
     pub fn remove_room(&self, room_id: &str) {
         if let Some(room) = self.repo.remove_room(room_id) {
-            for (participant_id, connection) in room.participants() {
-                connection.close(wtransport::VarInt::from_u32(410), b"room closed");
-                tracing::info!(room_id = %room_id, participant_id = %participant_id, "participant connection closed");
+            if let Some(participants) = room.participants() {
+                for (participant_id, connection) in participants {
+                    connection.close(wtransport::VarInt::from_u32(410), b"room closed");
+                    tracing::info!(room_id = %room_id, participant_id = %participant_id, "participant connection closed");
+                }
             }
             tracing::info!(room_id = %room_id, "room removed");
         }

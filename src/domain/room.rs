@@ -13,28 +13,32 @@ pub const CALIBRATION_SOUND_COUNT: usize = 3;
 
 pub enum Room {
     Waiting(WaitingRoom),
-    HostJoined(HostJoinedRoom),
+    HostJoined(Box<HostJoinedRoom>),
 }
 
 impl Room {
-    pub fn participants(&self) -> &HashMap<Uuid, wtransport::Connection> {
+    /// Returns the room's participants; `None` while the room is waiting for
+    /// its host, as participants may join only after the host has joined.
+    pub fn participants(&self) -> Option<&HashMap<Uuid, wtransport::Connection>> {
         match self {
-            Room::Waiting(waiting) => &waiting.participants,
-            Room::HostJoined(joined) => &joined.participants,
+            Room::Waiting(_) => None,
+            Room::HostJoined(joined) => Some(&joined.participants),
         }
     }
 
-    pub(crate) fn participants_mut(&mut self) -> &mut HashMap<Uuid, wtransport::Connection> {
+    pub(crate) fn participants_mut(
+        &mut self,
+    ) -> Option<&mut HashMap<Uuid, wtransport::Connection>> {
         match self {
-            Room::Waiting(waiting) => &mut waiting.participants,
-            Room::HostJoined(joined) => &mut joined.participants,
+            Room::Waiting(_) => None,
+            Room::HostJoined(joined) => Some(&mut joined.participants),
         }
     }
 
     pub(crate) fn host_joined_mut(&mut self) -> Option<&mut HostJoinedRoom> {
         match self {
             Room::Waiting(_) => None,
-            Room::HostJoined(joined) => Some(joined),
+            Room::HostJoined(joined) => Some(joined.as_mut()),
         }
     }
 }
@@ -61,16 +65,11 @@ impl Host {
 pub struct WaitingRoom {
     host_token: String,
     song: CompleteSongData,
-    participants: HashMap<Uuid, wtransport::Connection>,
 }
 
 impl WaitingRoom {
     pub fn new(song: CompleteSongData, host_token: String) -> Self {
-        Self {
-            host_token,
-            song,
-            participants: HashMap::new(),
-        }
+        Self { host_token, song }
     }
 
     pub fn song(&self) -> &CompleteSongData {
@@ -85,7 +84,7 @@ impl WaitingRoom {
         HostJoinedRoom {
             host,
             song: self.song,
-            participants: self.participants,
+            participants: HashMap::new(),
             calibration: None,
             lags: HashMap::new(),
         }
