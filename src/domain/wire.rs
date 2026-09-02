@@ -33,6 +33,7 @@
 //! | 0x05 | C -> S    | Ready              | empty                              |
 //! | 0x06 | C -> S    | Stamp              | u8 stamp id                        |
 //! | 0x07 | C -> S    | LiveStart          | u64 (unix µs, live start time)     |
+//! | 0x08 | C -> S    | ColorChange        | u8 color id                        |
 //! | 0x81 | S -> C    | Joined             | 16-byte UUID (participant id)      |
 //! | 0x83 | S -> C    | TimeSyncResponse   | u64 t1 + u64 t2 (unix µs)          |
 //! | 0x82 | S -> C    | Error              | u16 length + UTF-8 message         |
@@ -40,12 +41,13 @@
 //! | 0x85 | S -> C    | ParticipantReady   | 16-byte UUID (participant id)      |
 //! | 0x86 | S -> C    | ParticipantStamp   | 16-byte UUID (participant id) + u8 stamp id |
 //! | 0x87 | S -> C    | LiveStarted        | u64 (unix µs, live start time)     |
+//! | 0x88 | S -> C    | ParticipantColorChange | 16-byte UUID (participant id) + u8 color id |
 //!
 //! `Joined` and `TimeSyncResponse` are responses written on the
 //! client-initiated stream that carried the request; `ParticipantJoined`,
-//! `ParticipantReady`, `ParticipantStamp` and `LiveStarted` are pushed by the
-//! server on a server-initiated bidirectional stream (clients must accept
-//! incoming streams).
+//! `ParticipantReady`, `ParticipantStamp`, `LiveStarted` and
+//! `ParticipantColorChange` are pushed by the server on a server-initiated
+//! bidirectional stream (clients must accept incoming streams).
 
 use std::str::from_utf8;
 
@@ -67,6 +69,8 @@ pub const EVENT_READY: u8 = 0x05;
 pub const EVENT_STAMP: u8 = 0x06;
 /// Event ID of [`ClientMessage::LiveStart`].
 pub const EVENT_LIVE_START: u8 = 0x07;
+/// Event ID of [`ClientMessage::ColorChange`].
+pub const EVENT_COLOR_CHANGE: u8 = 0x08;
 /// Event ID of [`ServerMessage::Joined`].
 pub const EVENT_JOINED: u8 = 0x81;
 /// Event ID of [`ServerMessage::TimeSyncResponse`].
@@ -81,6 +85,8 @@ pub const EVENT_PARTICIPANT_READY: u8 = 0x85;
 pub const EVENT_PARTICIPANT_STAMP: u8 = 0x86;
 /// Event ID of [`ServerMessage::LiveStarted`].
 pub const EVENT_LIVE_STARTED: u8 = 0x87;
+/// Event ID of [`ServerMessage::ParticipantColorChange`].
+pub const EVENT_PARTICIPANT_COLOR_CHANGE: u8 = 0x88;
 
 #[derive(Debug, thiserror::Error)]
 pub enum EncodeError {
@@ -261,6 +267,10 @@ impl Encode for ClientMessage {
                 EVENT_STAMP.encode(buf)?;
                 stamp_id.encode(buf)
             }
+            ClientMessage::ColorChange { color_id } => {
+                EVENT_COLOR_CHANGE.encode(buf)?;
+                color_id.encode(buf)
+            }
             ClientMessage::LiveStart { start_time } => {
                 EVENT_LIVE_START.encode(buf)?;
                 start_time.encode(buf)
@@ -284,6 +294,9 @@ impl Decode for ClientMessage {
             EVENT_READY => Ok(ClientMessage::Ready),
             EVENT_STAMP => Ok(ClientMessage::Stamp {
                 stamp_id: u8::decode(buf)?,
+            }),
+            EVENT_COLOR_CHANGE => Ok(ClientMessage::ColorChange {
+                color_id: u8::decode(buf)?,
             }),
             EVENT_LIVE_START => Ok(ClientMessage::LiveStart {
                 start_time: u64::decode(buf)?,
@@ -325,6 +338,14 @@ impl Encode for ServerMessage {
                 participant_id.encode(buf)?;
                 stamp_id.encode(buf)
             }
+            ServerMessage::ParticipantColorChange {
+                participant_id,
+                color_id,
+            } => {
+                EVENT_PARTICIPANT_COLOR_CHANGE.encode(buf)?;
+                participant_id.encode(buf)?;
+                color_id.encode(buf)
+            }
             ServerMessage::LiveStarted { start_time } => {
                 EVENT_LIVE_STARTED.encode(buf)?;
                 start_time.encode(buf)
@@ -355,6 +376,10 @@ impl Decode for ServerMessage {
             EVENT_PARTICIPANT_STAMP => Ok(ServerMessage::ParticipantStamp {
                 participant_id: Uuid::decode(buf)?,
                 stamp_id: u8::decode(buf)?,
+            }),
+            EVENT_PARTICIPANT_COLOR_CHANGE => Ok(ServerMessage::ParticipantColorChange {
+                participant_id: Uuid::decode(buf)?,
+                color_id: u8::decode(buf)?,
             }),
             EVENT_LIVE_STARTED => Ok(ServerMessage::LiveStarted {
                 start_time: u64::decode(buf)?,
@@ -465,6 +490,40 @@ mod tests {
                 participant_id,
                 stamp_id,
             } => assert_eq!((participant_id, stamp_id), (id, 7)),
+            other => panic!("unexpected message: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn color_change_roundtrip() {
+        let mut buf = Vec::new();
+        ClientMessage::ColorChange { color_id: 42 }
+            .encode(&mut buf)
+            .expect("encode color change");
+        assert_eq!(buf, [EVENT_COLOR_CHANGE, 42]);
+        match decode_exact::<ClientMessage>(&buf).expect("decode color change") {
+            ClientMessage::ColorChange { color_id } => assert_eq!(color_id, 42),
+            other => panic!("unexpected message: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn participant_color_change_roundtrip() {
+        let id = Uuid::now_v7();
+        let mut buf = Vec::new();
+        ServerMessage::ParticipantColorChange {
+            participant_id: id,
+            color_id: 7,
+        }
+        .encode(&mut buf)
+        .expect("encode participant color change");
+        assert_eq!(buf[0], EVENT_PARTICIPANT_COLOR_CHANGE);
+        assert_eq!(buf.len(), 18);
+        match decode_exact::<ServerMessage>(&buf).expect("decode participant color change") {
+            ServerMessage::ParticipantColorChange {
+                participant_id,
+                color_id,
+            } => assert_eq!((participant_id, color_id), (id, 7)),
             other => panic!("unexpected message: {other:?}"),
         }
     }
@@ -683,10 +742,24 @@ mod tests {
             Err(DecodeError::UnexpectedEof)
         ));
         assert!(matches!(
+            decode_exact::<ClientMessage>(&[EVENT_COLOR_CHANGE]),
+            Err(DecodeError::UnexpectedEof)
+        ));
+        assert!(matches!(
             decode_exact::<ServerMessage>(&[EVENT_PARTICIPANT_STAMP]),
             Err(DecodeError::UnexpectedEof)
         ));
+        assert!(matches!(
+            decode_exact::<ServerMessage>(&[EVENT_PARTICIPANT_COLOR_CHANGE]),
+            Err(DecodeError::UnexpectedEof)
+        ));
         let mut buf = vec![EVENT_PARTICIPANT_STAMP];
+        buf.extend_from_slice(&[0u8; 15]);
+        assert!(matches!(
+            decode_exact::<ServerMessage>(&buf),
+            Err(DecodeError::UnexpectedEof)
+        ));
+        let mut buf = vec![EVENT_PARTICIPANT_COLOR_CHANGE];
         buf.extend_from_slice(&[0u8; 15]);
         assert!(matches!(
             decode_exact::<ServerMessage>(&buf),
@@ -736,7 +809,20 @@ mod tests {
             decode_exact::<ClientMessage>(&buf),
             Err(DecodeError::TrailingBytes)
         ));
+        buf = vec![EVENT_COLOR_CHANGE];
+        buf.extend_from_slice(&[0u8; 2]);
+        assert!(matches!(
+            decode_exact::<ClientMessage>(&buf),
+            Err(DecodeError::TrailingBytes)
+        ));
         buf = vec![EVENT_PARTICIPANT_STAMP];
+        buf.extend_from_slice(&[0u8; 17]);
+        buf.push(0x00);
+        assert!(matches!(
+            decode_exact::<ServerMessage>(&buf),
+            Err(DecodeError::TrailingBytes)
+        ));
+        buf = vec![EVENT_PARTICIPANT_COLOR_CHANGE];
         buf.extend_from_slice(&[0u8; 17]);
         buf.push(0x00);
         assert!(matches!(

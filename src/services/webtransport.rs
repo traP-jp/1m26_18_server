@@ -417,6 +417,12 @@ async fn handle_bi_stream(
             handle_stamp(room_service, room_id, client_id, is_host, stamp_id);
             None
         }
+        Ok(ClientMessage::ColorChange { color_id }) => {
+            // Fire-and-forget: the server relays the color change to the host
+            // and never responds.
+            handle_color_change(room_service, room_id, client_id, is_host, color_id);
+            None
+        }
         Ok(ClientMessage::LiveStart { start_time }) => {
             // Fire-and-forget: the server transitions the room to live and
             // broadcasts the start time to every participant; it never
@@ -532,6 +538,41 @@ fn handle_stamp(
         ServerMessage::ParticipantStamp {
             participant_id,
             stamp_id,
+        },
+    ));
+}
+
+/// Relays a participant's color change to the host on a server-initiated
+/// bidirectional stream. The color id is passed through uninterpreted.
+fn handle_color_change(
+    room_service: &RoomService,
+    room_id: &str,
+    participant_id: Uuid,
+    is_host: bool,
+    color_id: u8,
+) {
+    if is_host {
+        warn!(
+            room_id = %room_id,
+            host_id = %participant_id,
+            "ignoring color change from the host"
+        );
+        return;
+    }
+    tracing::debug!(
+        room_id = %room_id,
+        participant_id = %participant_id,
+        color_id,
+        "participant sent a color change"
+    );
+    // Fire-and-forget: the relay flow must not block on (or fail with) the
+    // host notification.
+    tokio::spawn(notify_host(
+        room_service.clone(),
+        room_id.to_string(),
+        ServerMessage::ParticipantColorChange {
+            participant_id,
+            color_id,
         },
     ));
 }
@@ -723,6 +764,9 @@ mod tests {
             }
             ServerMessage::ParticipantStamp { .. } => {
                 panic!("unexpected participant stamp notification")
+            }
+            ServerMessage::ParticipantColorChange { .. } => {
+                panic!("unexpected participant color change notification")
             }
             ServerMessage::LiveStarted { .. } => {
                 panic!("unexpected live started notification")
@@ -1569,6 +1613,108 @@ mod tests {
         assert!(response.is_empty());
         let result = timeout(Duration::from_millis(300), host.accept_bi()).await;
         assert!(result.is_err(), "host stamp report must not notify anyone");
+
+        host.close(wtransport::VarInt::from_u32(0), b"done");
+        participant.close(wtransport::VarInt::from_u32(0), b"done");
+    }
+
+    #[tokio::test]
+    async fn test_webtransport_participant_color_change_notifies_host() {
+        let room_id = "9495";
+        let (_room_repo, room_service) = setup_room_service(room_id);
+
+        let (server_port, cert_hash) = start_server(room_service).await;
+        let client = test_client(cert_hash);
+
+        let host = client
+            .connect(format!(
+                "https://127.0.0.1:{server_port}/rooms/{room_id}?hostToken={HOST_TOKEN}"
+            ))
+            .await
+            .expect("connect as host");
+        sleep(Duration::from_millis(200)).await;
+
+        let participant = client
+            .connect(format!("https://127.0.0.1:{server_port}/rooms/{room_id}"))
+            .await
+            .expect("connect as participant");
+        let participant_id = join_as_participant(&participant).await;
+
+        // Drain the participant-joined notification first.
+        let (_send_stream, mut recv_stream) = host
+            .accept_bi()
+            .await
+            .expect("host accepts server-initiated stream");
+        let mut buf = Vec::new();
+        recv_stream
+            .read_to_end(&mut buf)
+            .await
+            .expect("read_to_end");
+        assert!(matches!(
+            decode_exact::<ServerMessage>(&buf).expect("valid server message"),
+            ServerMessage::ParticipantJoined { .. }
+        ));
+
+        // The participant sends a color change; the host is notified with the
+        // sender's id and the (uninterpreted) color id.
+        let response =
+            send_client_message(&participant, &ClientMessage::ColorChange { color_id: 42 }).await;
+        assert!(response.is_empty(), "color change must not get a response");
+
+        let (_send_stream, mut recv_stream) = host
+            .accept_bi()
+            .await
+            .expect("host accepts server-initiated stream");
+        let mut buf = Vec::new();
+        recv_stream
+            .read_to_end(&mut buf)
+            .await
+            .expect("read_to_end");
+        match decode_exact::<ServerMessage>(&buf).expect("valid server message") {
+            ServerMessage::ParticipantColorChange {
+                participant_id: notified,
+                color_id,
+            } => {
+                assert_eq!(notified, participant_id);
+                assert_eq!(color_id, 42);
+            }
+            other => panic!("unexpected message: {other:?}"),
+        }
+
+        // Every color change report is relayed; color ids are opaque to the
+        // server.
+        for color_id in [0u8, 255] {
+            send_client_message(&participant, &ClientMessage::ColorChange { color_id }).await;
+            let (_send_stream, mut recv_stream) = host
+                .accept_bi()
+                .await
+                .expect("host accepts server-initiated stream");
+            let mut buf = Vec::new();
+            recv_stream
+                .read_to_end(&mut buf)
+                .await
+                .expect("read_to_end");
+            match decode_exact::<ServerMessage>(&buf).expect("valid server message") {
+                ServerMessage::ParticipantColorChange {
+                    participant_id: notified,
+                    color_id: notified_color,
+                } => {
+                    assert_eq!(notified, participant_id);
+                    assert_eq!(notified_color, color_id);
+                }
+                other => panic!("unexpected message: {other:?}"),
+            }
+        }
+
+        // A color change report from the host is ignored.
+        let response =
+            send_client_message(&host, &ClientMessage::ColorChange { color_id: 1 }).await;
+        assert!(response.is_empty());
+        let result = timeout(Duration::from_millis(300), host.accept_bi()).await;
+        assert!(
+            result.is_err(),
+            "host color change report must not notify anyone"
+        );
 
         host.close(wtransport::VarInt::from_u32(0), b"done");
         participant.close(wtransport::VarInt::from_u32(0), b"done");

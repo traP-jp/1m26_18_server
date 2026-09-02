@@ -363,6 +363,12 @@ pub enum ClientMessage {
     Stamp {
         stamp_id: u8,
     },
+    /// Participant: reports a color change to the host. The server does not
+    /// interpret the color id; the meaning of each id is a client-side
+    /// concern. Sent per change, with no server-side state.
+    ColorChange {
+        color_id: u8,
+    },
     /// Host: announces the start time of the live (unix microseconds) and
     /// transitions the room to live. The server broadcasts the start time to
     /// every participant. Idempotent: a repeated announcement does not
@@ -404,6 +410,13 @@ pub enum ServerMessage {
     ParticipantStamp {
         participant_id: Uuid,
         stamp_id: u8,
+    },
+    /// Host only: a participant reported a color change. Relayed as-is; the
+    /// server does not interpret the color id. Sent on a server-initiated
+    /// bidirectional stream, once per color change report.
+    ParticipantColorChange {
+        participant_id: Uuid,
+        color_id: u8,
     },
     /// Participants: the live has started. Carries the start time (unix
     /// microseconds) announced by the host. Sent on a server-initiated
