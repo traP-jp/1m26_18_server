@@ -305,6 +305,12 @@ pub enum ClientMessage {
     /// Participant: reports itself as ready to start. Idempotent; a repeated
     /// report does not change the state.
     Ready,
+    /// Participant: sends a stamp to the host. The server does not interpret
+    /// the stamp id; the meaning of each id is a client-side concern. Sent
+    /// per stamp, with no server-side state.
+    Stamp {
+        stamp_id: u8,
+    },
 }
 
 /// Message sent from the server to the client over WebTransport.
@@ -332,6 +338,13 @@ pub enum ServerMessage {
     /// report does not retrigger the notification).
     ParticipantReady {
         participant_id: Uuid,
+    },
+    /// Host only: a participant sent a stamp. Relayed as-is; the server does
+    /// not interpret the stamp id. Sent on a server-initiated bidirectional
+    /// stream, once per stamp report.
+    ParticipantStamp {
+        participant_id: Uuid,
+        stamp_id: u8,
     },
 }
 

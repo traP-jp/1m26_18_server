@@ -349,6 +349,12 @@ async fn handle_bi_stream(
             handle_ready(room_service, room_id, client_id, is_host);
             None
         }
+        Ok(ClientMessage::Stamp { stamp_id }) => {
+            // Fire-and-forget: the server relays the stamp to the host and
+            // never responds.
+            handle_stamp(room_service, room_id, client_id, is_host, stamp_id);
+            None
+        }
         Err(e) => {
             // Unknown event IDs and malformed messages are ignored silently
             // (no response is written) so that new client events can be
@@ -424,6 +430,41 @@ fn handle_ready(room_service: &RoomService, room_id: &str, participant_id: Uuid,
             );
         }
     }
+}
+
+/// Relays a participant's stamp to the host on a server-initiated
+/// bidirectional stream. The stamp id is passed through uninterpreted.
+fn handle_stamp(
+    room_service: &RoomService,
+    room_id: &str,
+    participant_id: Uuid,
+    is_host: bool,
+    stamp_id: u8,
+) {
+    if is_host {
+        warn!(
+            room_id = %room_id,
+            host_id = %participant_id,
+            "ignoring stamp from the host"
+        );
+        return;
+    }
+    tracing::debug!(
+        room_id = %room_id,
+        participant_id = %participant_id,
+        stamp_id,
+        "participant sent a stamp"
+    );
+    // Fire-and-forget: the relay flow must not block on (or fail with) the
+    // host notification.
+    tokio::spawn(notify_host(
+        room_service.clone(),
+        room_id.to_string(),
+        ServerMessage::ParticipantStamp {
+            participant_id,
+            stamp_id,
+        },
+    ));
 }
 
 fn handle_calibration_detect(
@@ -579,6 +620,9 @@ mod tests {
             }
             ServerMessage::ParticipantReady { .. } => {
                 panic!("unexpected participant ready notification")
+            }
+            ServerMessage::ParticipantStamp { .. } => {
+                panic!("unexpected participant stamp notification")
             }
         }
     }
@@ -1311,6 +1355,103 @@ mod tests {
         assert!(response.is_empty());
         let result = timeout(Duration::from_millis(300), host.accept_bi()).await;
         assert!(result.is_err(), "host ready report must not notify anyone");
+
+        host.close(wtransport::VarInt::from_u32(0), b"done");
+        participant.close(wtransport::VarInt::from_u32(0), b"done");
+    }
+
+    #[tokio::test]
+    async fn test_webtransport_participant_stamp_notifies_host() {
+        let room_id = "9292";
+        let (_room_repo, room_service) = setup_room_service(room_id);
+
+        let (server_port, cert_hash) = start_server(room_service).await;
+        let client = test_client(cert_hash);
+
+        let host = client
+            .connect(format!(
+                "https://127.0.0.1:{server_port}/rooms/{room_id}?hostToken={HOST_TOKEN}"
+            ))
+            .await
+            .expect("connect as host");
+        sleep(Duration::from_millis(200)).await;
+
+        let participant = client
+            .connect(format!("https://127.0.0.1:{server_port}/rooms/{room_id}"))
+            .await
+            .expect("connect as participant");
+        let participant_id = join_as_participant(&participant).await;
+
+        // Drain the participant-joined notification first.
+        let (_send_stream, mut recv_stream) = host
+            .accept_bi()
+            .await
+            .expect("host accepts server-initiated stream");
+        let mut buf = Vec::new();
+        recv_stream
+            .read_to_end(&mut buf)
+            .await
+            .expect("read_to_end");
+        assert!(matches!(
+            decode_exact::<ServerMessage>(&buf).expect("valid server message"),
+            ServerMessage::ParticipantJoined { .. }
+        ));
+
+        // The participant sends a stamp; the host is notified with the
+        // sender's id and the (uninterpreted) stamp id.
+        let response =
+            send_client_message(&participant, &ClientMessage::Stamp { stamp_id: 42 }).await;
+        assert!(response.is_empty(), "stamp must not get a response");
+
+        let (_send_stream, mut recv_stream) = host
+            .accept_bi()
+            .await
+            .expect("host accepts server-initiated stream");
+        let mut buf = Vec::new();
+        recv_stream
+            .read_to_end(&mut buf)
+            .await
+            .expect("read_to_end");
+        match decode_exact::<ServerMessage>(&buf).expect("valid server message") {
+            ServerMessage::ParticipantStamp {
+                participant_id: notified,
+                stamp_id,
+            } => {
+                assert_eq!(notified, participant_id);
+                assert_eq!(stamp_id, 42);
+            }
+            other => panic!("unexpected message: {other:?}"),
+        }
+
+        // Every stamp report is relayed; stamp ids are opaque to the server.
+        for stamp_id in [0u8, 255] {
+            send_client_message(&participant, &ClientMessage::Stamp { stamp_id }).await;
+            let (_send_stream, mut recv_stream) = host
+                .accept_bi()
+                .await
+                .expect("host accepts server-initiated stream");
+            let mut buf = Vec::new();
+            recv_stream
+                .read_to_end(&mut buf)
+                .await
+                .expect("read_to_end");
+            match decode_exact::<ServerMessage>(&buf).expect("valid server message") {
+                ServerMessage::ParticipantStamp {
+                    participant_id: notified,
+                    stamp_id: notified_stamp,
+                } => {
+                    assert_eq!(notified, participant_id);
+                    assert_eq!(notified_stamp, stamp_id);
+                }
+                other => panic!("unexpected message: {other:?}"),
+            }
+        }
+
+        // A stamp report from the host is ignored.
+        let response = send_client_message(&host, &ClientMessage::Stamp { stamp_id: 1 }).await;
+        assert!(response.is_empty());
+        let result = timeout(Duration::from_millis(300), host.accept_bi()).await;
+        assert!(result.is_err(), "host stamp report must not notify anyone");
 
         host.close(wtransport::VarInt::from_u32(0), b"done");
         participant.close(wtransport::VarInt::from_u32(0), b"done");

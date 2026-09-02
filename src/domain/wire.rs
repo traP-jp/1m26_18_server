@@ -31,16 +31,19 @@
 //! | 0x03 | C -> S    | CalibrationStart   | 3 × u64 (unix µs, host sound times)|
 //! | 0x04 | C -> S    | CalibrationDetect  | u8 index + u64 (unix µs, detection)|
 //! | 0x05 | C -> S    | Ready              | empty                              |
+//! | 0x06 | C -> S    | Stamp              | u8 stamp id                        |
 //! | 0x81 | S -> C    | Joined             | 16-byte UUID (participant id)      |
 //! | 0x83 | S -> C    | TimeSyncResponse   | u64 t1 + u64 t2 (unix µs)          |
 //! | 0x82 | S -> C    | Error              | u16 length + UTF-8 message         |
 //! | 0x84 | S -> C    | ParticipantJoined  | 16-byte UUID (participant id)      |
 //! | 0x85 | S -> C    | ParticipantReady   | 16-byte UUID (participant id)      |
+//! | 0x86 | S -> C    | ParticipantStamp   | 16-byte UUID (participant id) + u8 stamp id |
 //!
 //! `Joined` and `TimeSyncResponse` are responses written on the
-//! client-initiated stream that carried the request; `ParticipantJoined` and
-//! `ParticipantReady` are pushed by the server on a server-initiated
-//! bidirectional stream (host clients must accept incoming streams).
+//! client-initiated stream that carried the request; `ParticipantJoined`,
+//! `ParticipantReady` and `ParticipantStamp` are pushed by the server on a
+//! server-initiated bidirectional stream (host clients must accept incoming
+//! streams).
 
 use std::str::from_utf8;
 
@@ -58,6 +61,8 @@ pub const EVENT_CALIBRATION_START: u8 = 0x03;
 pub const EVENT_CALIBRATION_DETECT: u8 = 0x04;
 /// Event ID of [`ClientMessage::Ready`].
 pub const EVENT_READY: u8 = 0x05;
+/// Event ID of [`ClientMessage::Stamp`].
+pub const EVENT_STAMP: u8 = 0x06;
 /// Event ID of [`ServerMessage::Joined`].
 pub const EVENT_JOINED: u8 = 0x81;
 /// Event ID of [`ServerMessage::TimeSyncResponse`].
@@ -68,6 +73,8 @@ pub const EVENT_ERROR: u8 = 0x82;
 pub const EVENT_PARTICIPANT_JOINED: u8 = 0x84;
 /// Event ID of [`ServerMessage::ParticipantReady`].
 pub const EVENT_PARTICIPANT_READY: u8 = 0x85;
+/// Event ID of [`ServerMessage::ParticipantStamp`].
+pub const EVENT_PARTICIPANT_STAMP: u8 = 0x86;
 
 #[derive(Debug, thiserror::Error)]
 pub enum EncodeError {
@@ -244,6 +251,10 @@ impl Encode for ClientMessage {
                 detected_at.encode(buf)
             }
             ClientMessage::Ready => EVENT_READY.encode(buf),
+            ClientMessage::Stamp { stamp_id } => {
+                EVENT_STAMP.encode(buf)?;
+                stamp_id.encode(buf)
+            }
         }
     }
 }
@@ -261,6 +272,9 @@ impl Decode for ClientMessage {
                 detected_at: u64::decode(buf)?,
             }),
             EVENT_READY => Ok(ClientMessage::Ready),
+            EVENT_STAMP => Ok(ClientMessage::Stamp {
+                stamp_id: u8::decode(buf)?,
+            }),
             id => Err(DecodeError::UnknownEventId(id)),
         }
     }
@@ -290,6 +304,14 @@ impl Encode for ServerMessage {
                 EVENT_PARTICIPANT_READY.encode(buf)?;
                 participant_id.encode(buf)
             }
+            ServerMessage::ParticipantStamp {
+                participant_id,
+                stamp_id,
+            } => {
+                EVENT_PARTICIPANT_STAMP.encode(buf)?;
+                participant_id.encode(buf)?;
+                stamp_id.encode(buf)
+            }
         }
     }
 }
@@ -312,6 +334,10 @@ impl Decode for ServerMessage {
             }),
             EVENT_PARTICIPANT_READY => Ok(ServerMessage::ParticipantReady {
                 participant_id: Uuid::decode(buf)?,
+            }),
+            EVENT_PARTICIPANT_STAMP => Ok(ServerMessage::ParticipantStamp {
+                participant_id: Uuid::decode(buf)?,
+                stamp_id: u8::decode(buf)?,
             }),
             id => Err(DecodeError::UnknownEventId(id)),
         }
@@ -385,6 +411,40 @@ mod tests {
         assert_eq!(buf.len(), 17);
         match decode_exact::<ServerMessage>(&buf).expect("decode participant ready") {
             ServerMessage::ParticipantReady { participant_id } => assert_eq!(participant_id, id),
+            other => panic!("unexpected message: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn stamp_roundtrip() {
+        let mut buf = Vec::new();
+        ClientMessage::Stamp { stamp_id: 42 }
+            .encode(&mut buf)
+            .expect("encode stamp");
+        assert_eq!(buf, [EVENT_STAMP, 42]);
+        match decode_exact::<ClientMessage>(&buf).expect("decode stamp") {
+            ClientMessage::Stamp { stamp_id } => assert_eq!(stamp_id, 42),
+            other => panic!("unexpected message: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn participant_stamp_roundtrip() {
+        let id = Uuid::now_v7();
+        let mut buf = Vec::new();
+        ServerMessage::ParticipantStamp {
+            participant_id: id,
+            stamp_id: 7,
+        }
+        .encode(&mut buf)
+        .expect("encode participant stamp");
+        assert_eq!(buf[0], EVENT_PARTICIPANT_STAMP);
+        assert_eq!(buf.len(), 18);
+        match decode_exact::<ServerMessage>(&buf).expect("decode participant stamp") {
+            ServerMessage::ParticipantStamp {
+                participant_id,
+                stamp_id,
+            } => assert_eq!((participant_id, stamp_id), (id, 7)),
             other => panic!("unexpected message: {other:?}"),
         }
     }
@@ -562,6 +622,20 @@ mod tests {
             decode_exact::<ClientMessage>(&[]),
             Err(DecodeError::UnexpectedEof)
         ));
+        assert!(matches!(
+            decode_exact::<ClientMessage>(&[EVENT_STAMP]),
+            Err(DecodeError::UnexpectedEof)
+        ));
+        assert!(matches!(
+            decode_exact::<ServerMessage>(&[EVENT_PARTICIPANT_STAMP]),
+            Err(DecodeError::UnexpectedEof)
+        ));
+        let mut buf = vec![EVENT_PARTICIPANT_STAMP];
+        buf.extend_from_slice(&[0u8; 15]);
+        assert!(matches!(
+            decode_exact::<ServerMessage>(&buf),
+            Err(DecodeError::UnexpectedEof)
+        ));
     }
 
     #[test]
@@ -599,6 +673,19 @@ mod tests {
         assert!(matches!(
             decode_exact::<ServerMessage>(&buf),
             Err(DecodeError::UnexpectedEof)
+        ));
+        buf = vec![EVENT_STAMP];
+        buf.extend_from_slice(&[0u8; 2]);
+        assert!(matches!(
+            decode_exact::<ClientMessage>(&buf),
+            Err(DecodeError::TrailingBytes)
+        ));
+        buf = vec![EVENT_PARTICIPANT_STAMP];
+        buf.extend_from_slice(&[0u8; 17]);
+        buf.push(0x00);
+        assert!(matches!(
+            decode_exact::<ServerMessage>(&buf),
+            Err(DecodeError::TrailingBytes)
         ));
         buf = vec![
             EVENT_TIME_SYNC_RESPONSE,
