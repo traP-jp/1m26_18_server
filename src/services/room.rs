@@ -4,7 +4,7 @@ use uuid::Uuid;
 use crate::domain::model::SongData;
 use crate::domain::room::{CALIBRATION_SOUND_COUNT, DetectionOutcome, Room, WaitingRoom};
 use crate::repository::room::{
-    CalibrationError, InsertHostError, InsertParticipantError, RoomRepository,
+    CalibrationError, InsertHostError, InsertParticipantError, RoomRepository, SetReadyError,
 };
 use crate::services::song::{SongService, SongServiceError};
 
@@ -64,6 +64,19 @@ impl RoomService {
         tracing::info!(room_id = %room_id, participant_id = %participant_id, "participant left room");
     }
 
+    /// Marks a participant as ready (participant's own report). Returns
+    /// whether this call caused the transition (i.e. the participant was not
+    /// ready before); a repeated report is idempotent and returns `Ok(false)`.
+    pub fn set_ready(&self, room_id: &str, participant_id: &Uuid) -> Result<bool, SetReadyError> {
+        let newly_ready = self.repo.set_ready(room_id, participant_id)?;
+        if newly_ready {
+            tracing::info!(room_id = %room_id, participant_id = %participant_id, "participant is ready");
+        } else {
+            tracing::debug!(room_id = %room_id, participant_id = %participant_id, "participant is already ready");
+        }
+        Ok(newly_ready)
+    }
+
     /// Validates the host token for a room (before accepting a WebTransport session).
     pub fn validate_host_token(&self, room_id: &str, token: &str) -> Result<(), InsertHostError> {
         self.repo.validate_host_token(room_id, token)
@@ -99,8 +112,10 @@ impl RoomService {
     pub fn remove_room(&self, room_id: &str) {
         if let Some(room) = self.repo.remove_room(room_id) {
             if let Some(participants) = room.participants() {
-                for (participant_id, connection) in participants {
-                    connection.close(wtransport::VarInt::from_u32(410), b"room closed");
+                for (participant_id, participant) in participants {
+                    participant
+                        .connection()
+                        .close(wtransport::VarInt::from_u32(410), b"room closed");
                     tracing::info!(room_id = %room_id, participant_id = %participant_id, "participant connection closed");
                 }
             }

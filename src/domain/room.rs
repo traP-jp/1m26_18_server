@@ -19,16 +19,14 @@ pub enum Room {
 impl Room {
     /// Returns the room's participants; `None` while the room is waiting for
     /// its host, as participants may join only after the host has joined.
-    pub fn participants(&self) -> Option<&HashMap<Uuid, wtransport::Connection>> {
+    pub fn participants(&self) -> Option<&HashMap<Uuid, Participant>> {
         match self {
             Room::Waiting(_) => None,
             Room::HostJoined(joined) => Some(&joined.participants),
         }
     }
 
-    pub(crate) fn participants_mut(
-        &mut self,
-    ) -> Option<&mut HashMap<Uuid, wtransport::Connection>> {
+    pub(crate) fn participants_mut(&mut self) -> Option<&mut HashMap<Uuid, Participant>> {
         match self {
             Room::Waiting(_) => None,
             Room::HostJoined(joined) => Some(&mut joined.participants),
@@ -91,10 +89,35 @@ impl WaitingRoom {
     }
 }
 
+/// A participant of a room, along with its readiness state.
+pub struct Participant {
+    connection: wtransport::Connection,
+    /// Whether the participant has reported itself as ready. Starts as
+    /// `false`; a participant may only become ready (never un-ready).
+    is_ready: bool,
+}
+
+impl Participant {
+    pub fn new(connection: wtransport::Connection) -> Self {
+        Self {
+            connection,
+            is_ready: false,
+        }
+    }
+
+    pub fn connection(&self) -> &wtransport::Connection {
+        &self.connection
+    }
+
+    pub fn is_ready(&self) -> bool {
+        self.is_ready
+    }
+}
+
 pub struct HostJoinedRoom {
     host: Host,
     song: CompleteSongData,
-    participants: HashMap<Uuid, wtransport::Connection>,
+    participants: HashMap<Uuid, Participant>,
     /// In-progress latency calibration, started by the host.
     calibration: Option<Calibration>,
     /// Determined per-participant latency in microseconds
@@ -121,6 +144,16 @@ impl HostJoinedRoom {
 
     pub(crate) fn insert_lag(&mut self, participant_id: Uuid, lag: i64) {
         self.lags.insert(participant_id, lag);
+    }
+
+    /// Marks a participant as ready. Returns whether this call caused the
+    /// transition (i.e. the participant was not ready before); repeated
+    /// reports are idempotent and return `false`.
+    pub(crate) fn set_ready(&mut self, participant_id: &Uuid) -> Option<bool> {
+        let participant = self.participants.get_mut(participant_id)?;
+        let newly_ready = !participant.is_ready;
+        participant.is_ready = true;
+        Some(newly_ready)
     }
 
     #[cfg(test)]
@@ -269,6 +302,9 @@ pub enum ClientMessage {
         sound_index: usize,
         detected_at: u64,
     },
+    /// Participant: reports itself as ready to start. Idempotent; a repeated
+    /// report does not change the state.
+    Ready,
 }
 
 /// Message sent from the server to the client over WebTransport.
@@ -289,6 +325,12 @@ pub enum ServerMessage {
     /// Host only: a participant joined the room. Sent on a server-initiated
     /// bidirectional stream.
     ParticipantJoined {
+        participant_id: Uuid,
+    },
+    /// Host only: a participant reported itself as ready to start. Sent on a
+    /// server-initiated bidirectional stream, once per participant (a repeated
+    /// report does not retrigger the notification).
+    ParticipantReady {
         participant_id: Uuid,
     },
 }

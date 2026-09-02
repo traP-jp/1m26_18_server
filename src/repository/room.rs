@@ -3,7 +3,9 @@ use std::{collections::HashMap, sync::Arc};
 use parking_lot::RwLock;
 use uuid::Uuid;
 
-use crate::domain::room::{CALIBRATION_SOUND_COUNT, DetectionError, DetectionOutcome, Host, Room};
+use crate::domain::room::{
+    CALIBRATION_SOUND_COUNT, DetectionError, DetectionOutcome, Host, Participant, Room,
+};
 
 #[derive(Clone, Default)]
 pub struct RoomRepository {
@@ -43,7 +45,7 @@ impl RoomRepository {
         match map.get_mut(room_id) {
             Some(room) => match room.participants_mut() {
                 Some(participants) => {
-                    participants.insert(participant_id, connection);
+                    participants.insert(participant_id, Participant::new(connection));
                     Ok(())
                 }
                 None => Err(InsertParticipantError::HostNotJoined),
@@ -59,6 +61,22 @@ impl RoomRepository {
             && let Some(participants) = room.participants_mut()
         {
             participants.remove(participant_id);
+        }
+    }
+
+    /// Marks a participant as ready. Returns whether this call caused the
+    /// transition (i.e. the participant was not ready before); a repeated
+    /// report is idempotent and returns `Ok(false)`.
+    pub fn set_ready(&self, room_id: &str, participant_id: &Uuid) -> Result<bool, SetReadyError> {
+        let mut map = self.inner.write();
+        match map.get_mut(room_id) {
+            Some(room) => {
+                let joined = room.host_joined_mut().ok_or(SetReadyError::HostNotJoined)?;
+                joined
+                    .set_ready(participant_id)
+                    .ok_or(SetReadyError::ParticipantNotFound)
+            }
+            None => Err(SetReadyError::RoomNotFound),
         }
     }
 
@@ -196,6 +214,16 @@ impl RoomRepository {
             _ => None,
         }
     }
+
+    #[cfg(test)]
+    pub fn participant_is_ready(&self, room_id: &str, participant_id: &Uuid) -> Option<bool> {
+        self.inner
+            .read()
+            .get(room_id)
+            .and_then(Room::participants)
+            .and_then(|participants| participants.get(participant_id))
+            .map(Participant::is_ready)
+    }
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -204,6 +232,16 @@ pub enum InsertParticipantError {
     RoomNotFound,
     #[error("host has not joined yet")]
     HostNotJoined,
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum SetReadyError {
+    #[error("room not found")]
+    RoomNotFound,
+    #[error("host has not joined yet")]
+    HostNotJoined,
+    #[error("participant not found")]
+    ParticipantNotFound,
 }
 
 #[derive(Debug, thiserror::Error)]

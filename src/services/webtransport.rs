@@ -182,10 +182,10 @@ impl WebTransportServer {
 
         // Fire-and-forget: the join flow must not block on (or fail with) the
         // host notification.
-        tokio::spawn(notify_host_participant_joined(
+        tokio::spawn(notify_host(
             room_service.clone(),
             room_id.clone(),
-            participant_id,
+            ServerMessage::ParticipantJoined { participant_id },
         ));
 
         handle_connection_streams(&room_service, &room_id, participant_id, false, &connection)
@@ -195,22 +195,16 @@ impl WebTransportServer {
     }
 }
 
-/// Notifies the room host that a participant joined, on a server-initiated
-/// bidirectional stream.
+/// Pushes a server-initiated event to the room host on a bidirectional
+/// stream.
 ///
 /// Fire-and-forget: a missing host (e.g. the room was removed concurrently)
 /// skips the notification, and any transport failure is only logged.
-async fn notify_host_participant_joined(
-    room_service: RoomService,
-    room_id: String,
-    participant_id: Uuid,
-) {
+async fn notify_host(room_service: RoomService, room_id: String, message: ServerMessage) {
     let Some(connection) = room_service.host_connection(&room_id) else {
-        debug!(room_id = %room_id, "host has not joined yet, skipping join notification");
+        debug!(room_id = %room_id, "host has not joined yet, skipping host notification");
         return;
     };
-
-    let message = ServerMessage::ParticipantJoined { participant_id };
 
     let result = async {
         let (mut send_stream, _recv_stream) = connection.open_bi().await?.await?;
@@ -220,10 +214,10 @@ async fn notify_host_participant_joined(
 
     match result {
         Ok(()) => {
-            info!(room_id = %room_id, participant_id = %participant_id, "notified host of participant join");
+            info!(room_id = %room_id, message = ?message, "notified host");
         }
         Err(e) => {
-            warn!(room_id = %room_id, participant_id = %participant_id, error = %e, "failed to notify host of participant join");
+            warn!(room_id = %room_id, message = ?message, error = %e, "failed to notify host");
         }
     }
 }
@@ -349,6 +343,12 @@ async fn handle_bi_stream(
             );
             None
         }
+        Ok(ClientMessage::Ready) => {
+            // Fire-and-forget: the server records the participant's readiness
+            // and never responds; the host is notified on the first report.
+            handle_ready(room_service, room_id, client_id, is_host);
+            None
+        }
         Err(e) => {
             // Unknown event IDs and malformed messages are ignored silently
             // (no response is written) so that new client events can be
@@ -390,6 +390,39 @@ fn handle_calibration_start(
     }
     if let Err(e) = room_service.start_calibration(room_id, times) {
         warn!(room_id = %room_id, error = %e, "failed to start calibration");
+    }
+}
+
+/// Records a participant's ready report and, on the first transition,
+/// notifies the host on a server-initiated bidirectional stream.
+fn handle_ready(room_service: &RoomService, room_id: &str, participant_id: Uuid, is_host: bool) {
+    if is_host {
+        warn!(
+            room_id = %room_id,
+            host_id = %participant_id,
+            "ignoring ready report from the host"
+        );
+        return;
+    }
+    match room_service.set_ready(room_id, &participant_id) {
+        Ok(true) => {
+            // Fire-and-forget: the report flow must not block on (or fail
+            // with) the host notification.
+            tokio::spawn(notify_host(
+                room_service.clone(),
+                room_id.to_string(),
+                ServerMessage::ParticipantReady { participant_id },
+            ));
+        }
+        Ok(false) => {}
+        Err(e) => {
+            warn!(
+                room_id = %room_id,
+                participant_id = %participant_id,
+                error = %e,
+                "failed to record participant ready"
+            );
+        }
     }
 }
 
@@ -466,7 +499,7 @@ mod tests {
         services::{room::RoomService, song::SongService},
     };
     use tokio::io::AsyncReadExt;
-    use tokio::time::sleep;
+    use tokio::time::{sleep, timeout};
     use wtransport::{ClientConfig, Endpoint, endpoint::endpoint_side};
 
     const HOST_TOKEN: &str = "test-host-token";
@@ -543,6 +576,9 @@ mod tests {
             ServerMessage::Error { message } => panic!("unexpected error: {message}"),
             ServerMessage::ParticipantJoined { .. } => {
                 panic!("unexpected participant joined notification")
+            }
+            ServerMessage::ParticipantReady { .. } => {
+                panic!("unexpected participant ready notification")
             }
         }
     }
@@ -1189,6 +1225,95 @@ mod tests {
             room_repo.exists(room_id),
             "room should survive a participant disconnect"
         );
+    }
+
+    #[tokio::test]
+    async fn test_webtransport_participant_ready_notifies_host() {
+        let room_id = "9191";
+        let (room_repo, room_service) = setup_room_service(room_id);
+
+        let (server_port, cert_hash) = start_server(room_service).await;
+        let client = test_client(cert_hash);
+
+        let host = client
+            .connect(format!(
+                "https://127.0.0.1:{server_port}/rooms/{room_id}?hostToken={HOST_TOKEN}"
+            ))
+            .await
+            .expect("connect as host");
+        sleep(Duration::from_millis(200)).await;
+
+        let participant = client
+            .connect(format!("https://127.0.0.1:{server_port}/rooms/{room_id}"))
+            .await
+            .expect("connect as participant");
+        let participant_id = join_as_participant(&participant).await;
+
+        // Drain the participant-joined notification first.
+        let (_send_stream, mut recv_stream) = host
+            .accept_bi()
+            .await
+            .expect("host accepts server-initiated stream");
+        let mut buf = Vec::new();
+        recv_stream
+            .read_to_end(&mut buf)
+            .await
+            .expect("read_to_end");
+        assert!(matches!(
+            decode_exact::<ServerMessage>(&buf).expect("valid server message"),
+            ServerMessage::ParticipantJoined { .. }
+        ));
+
+        assert_eq!(
+            room_repo.participant_is_ready(room_id, &participant_id),
+            Some(false),
+            "participants start as not ready"
+        );
+
+        // The participant reports itself as ready.
+        let response = send_client_message(&participant, &ClientMessage::Ready).await;
+        assert!(response.is_empty(), "ready must not get a response");
+        assert_eq!(
+            room_repo.participant_is_ready(room_id, &participant_id),
+            Some(true)
+        );
+
+        // The ready notification arrives on a server-initiated stream.
+        let (_send_stream, mut recv_stream) = host
+            .accept_bi()
+            .await
+            .expect("host accepts server-initiated stream");
+        let mut buf = Vec::new();
+        recv_stream
+            .read_to_end(&mut buf)
+            .await
+            .expect("read_to_end");
+        match decode_exact::<ServerMessage>(&buf).expect("valid server message") {
+            ServerMessage::ParticipantReady {
+                participant_id: notified,
+            } => {
+                assert_eq!(notified, participant_id);
+            }
+            other => panic!("unexpected message: {other:?}"),
+        }
+
+        // A repeated report does not retrigger the notification.
+        let response = send_client_message(&participant, &ClientMessage::Ready).await;
+        assert!(response.is_empty());
+        let result = timeout(Duration::from_millis(300), host.accept_bi()).await;
+        assert!(
+            result.is_err(),
+            "no second ready notification should be sent"
+        );
+
+        // A ready report from the host is ignored.
+        let response = send_client_message(&host, &ClientMessage::Ready).await;
+        assert!(response.is_empty());
+        let result = timeout(Duration::from_millis(300), host.accept_bi()).await;
+        assert!(result.is_err(), "host ready report must not notify anyone");
+
+        host.close(wtransport::VarInt::from_u32(0), b"done");
+        participant.close(wtransport::VarInt::from_u32(0), b"done");
     }
 
     #[tokio::test]
