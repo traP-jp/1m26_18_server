@@ -32,18 +32,20 @@
 //! | 0x04 | C -> S    | CalibrationDetect  | u8 index + u64 (unix µs, detection)|
 //! | 0x05 | C -> S    | Ready              | empty                              |
 //! | 0x06 | C -> S    | Stamp              | u8 stamp id                        |
+//! | 0x07 | C -> S    | LiveStart          | u64 (unix µs, live start time)     |
 //! | 0x81 | S -> C    | Joined             | 16-byte UUID (participant id)      |
 //! | 0x83 | S -> C    | TimeSyncResponse   | u64 t1 + u64 t2 (unix µs)          |
 //! | 0x82 | S -> C    | Error              | u16 length + UTF-8 message         |
 //! | 0x84 | S -> C    | ParticipantJoined  | 16-byte UUID (participant id)      |
 //! | 0x85 | S -> C    | ParticipantReady   | 16-byte UUID (participant id)      |
 //! | 0x86 | S -> C    | ParticipantStamp   | 16-byte UUID (participant id) + u8 stamp id |
+//! | 0x87 | S -> C    | LiveStarted        | u64 (unix µs, live start time)     |
 //!
 //! `Joined` and `TimeSyncResponse` are responses written on the
 //! client-initiated stream that carried the request; `ParticipantJoined`,
-//! `ParticipantReady` and `ParticipantStamp` are pushed by the server on a
-//! server-initiated bidirectional stream (host clients must accept incoming
-//! streams).
+//! `ParticipantReady`, `ParticipantStamp` and `LiveStarted` are pushed by the
+//! server on a server-initiated bidirectional stream (clients must accept
+//! incoming streams).
 
 use std::str::from_utf8;
 
@@ -63,6 +65,8 @@ pub const EVENT_CALIBRATION_DETECT: u8 = 0x04;
 pub const EVENT_READY: u8 = 0x05;
 /// Event ID of [`ClientMessage::Stamp`].
 pub const EVENT_STAMP: u8 = 0x06;
+/// Event ID of [`ClientMessage::LiveStart`].
+pub const EVENT_LIVE_START: u8 = 0x07;
 /// Event ID of [`ServerMessage::Joined`].
 pub const EVENT_JOINED: u8 = 0x81;
 /// Event ID of [`ServerMessage::TimeSyncResponse`].
@@ -75,6 +79,8 @@ pub const EVENT_PARTICIPANT_JOINED: u8 = 0x84;
 pub const EVENT_PARTICIPANT_READY: u8 = 0x85;
 /// Event ID of [`ServerMessage::ParticipantStamp`].
 pub const EVENT_PARTICIPANT_STAMP: u8 = 0x86;
+/// Event ID of [`ServerMessage::LiveStarted`].
+pub const EVENT_LIVE_STARTED: u8 = 0x87;
 
 #[derive(Debug, thiserror::Error)]
 pub enum EncodeError {
@@ -255,6 +261,10 @@ impl Encode for ClientMessage {
                 EVENT_STAMP.encode(buf)?;
                 stamp_id.encode(buf)
             }
+            ClientMessage::LiveStart { start_time } => {
+                EVENT_LIVE_START.encode(buf)?;
+                start_time.encode(buf)
+            }
         }
     }
 }
@@ -274,6 +284,9 @@ impl Decode for ClientMessage {
             EVENT_READY => Ok(ClientMessage::Ready),
             EVENT_STAMP => Ok(ClientMessage::Stamp {
                 stamp_id: u8::decode(buf)?,
+            }),
+            EVENT_LIVE_START => Ok(ClientMessage::LiveStart {
+                start_time: u64::decode(buf)?,
             }),
             id => Err(DecodeError::UnknownEventId(id)),
         }
@@ -312,6 +325,10 @@ impl Encode for ServerMessage {
                 participant_id.encode(buf)?;
                 stamp_id.encode(buf)
             }
+            ServerMessage::LiveStarted { start_time } => {
+                EVENT_LIVE_STARTED.encode(buf)?;
+                start_time.encode(buf)
+            }
         }
     }
 }
@@ -338,6 +355,9 @@ impl Decode for ServerMessage {
             EVENT_PARTICIPANT_STAMP => Ok(ServerMessage::ParticipantStamp {
                 participant_id: Uuid::decode(buf)?,
                 stamp_id: u8::decode(buf)?,
+            }),
+            EVENT_LIVE_STARTED => Ok(ServerMessage::LiveStarted {
+                start_time: u64::decode(buf)?,
             }),
             id => Err(DecodeError::UnknownEventId(id)),
         }
@@ -445,6 +465,42 @@ mod tests {
                 participant_id,
                 stamp_id,
             } => assert_eq!((participant_id, stamp_id), (id, 7)),
+            other => panic!("unexpected message: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn live_start_roundtrip() {
+        let mut buf = Vec::new();
+        ClientMessage::LiveStart {
+            start_time: 1_700_000_000_000_000,
+        }
+        .encode(&mut buf)
+        .expect("encode live start");
+        assert_eq!(buf[0], EVENT_LIVE_START);
+        assert_eq!(buf.len(), 9);
+        match decode_exact::<ClientMessage>(&buf).expect("decode live start") {
+            ClientMessage::LiveStart { start_time } => {
+                assert_eq!(start_time, 1_700_000_000_000_000);
+            }
+            other => panic!("unexpected message: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn live_started_roundtrip() {
+        let mut buf = Vec::new();
+        ServerMessage::LiveStarted {
+            start_time: 1_700_000_000_000_000,
+        }
+        .encode(&mut buf)
+        .expect("encode live started");
+        assert_eq!(buf[0], EVENT_LIVE_STARTED);
+        assert_eq!(buf.len(), 9);
+        match decode_exact::<ServerMessage>(&buf).expect("decode live started") {
+            ServerMessage::LiveStarted { start_time } => {
+                assert_eq!(start_time, 1_700_000_000_000_000);
+            }
             other => panic!("unexpected message: {other:?}"),
         }
     }

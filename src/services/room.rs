@@ -5,6 +5,7 @@ use crate::domain::model::SongData;
 use crate::domain::room::{CALIBRATION_SOUND_COUNT, DetectionOutcome, Room, WaitingRoom};
 use crate::repository::room::{
     CalibrationError, InsertHostError, InsertParticipantError, RoomRepository, SetReadyError,
+    StartLiveError,
 };
 use crate::services::song::{SongService, SongServiceError};
 
@@ -106,6 +107,23 @@ impl RoomService {
     /// Returns a clone of the room host's connection, if the host has joined.
     pub fn host_connection(&self, room_id: &str) -> Option<wtransport::Connection> {
         self.repo.host_connection(room_id)
+    }
+
+    /// Returns clones of the room participants' connections, along with their
+    /// ids, if the host has joined.
+    pub fn participant_connections(
+        &self,
+        room_id: &str,
+    ) -> Option<Vec<(Uuid, wtransport::Connection)>> {
+        self.repo.participant_connections(room_id)
+    }
+
+    /// Transitions the room to live with the start time (unix microseconds)
+    /// announced by the host.
+    pub fn start_live(&self, room_id: &str, start_time: u64) -> Result<(), StartLiveError> {
+        self.repo.start_live(room_id, start_time)?;
+        tracing::info!(room_id = %room_id, start_time, "live started");
+        Ok(())
     }
 
     /// Removes the room and closes all remaining participant connections (host disconnected).

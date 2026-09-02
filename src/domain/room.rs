@@ -14,6 +14,7 @@ pub const CALIBRATION_SOUND_COUNT: usize = 3;
 pub enum Room {
     Waiting(WaitingRoom),
     HostJoined(Box<HostJoinedRoom>),
+    Live(Box<LiveRoom>),
 }
 
 impl Room {
@@ -23,6 +24,7 @@ impl Room {
         match self {
             Room::Waiting(_) => None,
             Room::HostJoined(joined) => Some(&joined.participants),
+            Room::Live(live) => Some(&live.participants),
         }
     }
 
@@ -30,12 +32,13 @@ impl Room {
         match self {
             Room::Waiting(_) => None,
             Room::HostJoined(joined) => Some(&mut joined.participants),
+            Room::Live(live) => Some(&mut live.participants),
         }
     }
 
     pub(crate) fn host_joined_mut(&mut self) -> Option<&mut HostJoinedRoom> {
         match self {
-            Room::Waiting(_) => None,
+            Room::Waiting(_) | Room::Live(_) => None,
             Room::HostJoined(joined) => Some(joined.as_mut()),
         }
     }
@@ -154,6 +157,55 @@ impl HostJoinedRoom {
         let newly_ready = !participant.is_ready;
         participant.is_ready = true;
         Some(newly_ready)
+    }
+
+    /// Transitions the room to live with the given start time (unix
+    /// microseconds) announced by the host. Participants, determined lags and
+    /// the host connection are carried over; any in-progress calibration
+    /// round is discarded.
+    pub fn start_live(self, start_time: u64) -> LiveRoom {
+        LiveRoom {
+            host: self.host,
+            song: self.song,
+            participants: self.participants,
+            lags: self.lags,
+            start_time,
+        }
+    }
+
+    #[cfg(test)]
+    pub fn lag(&self, participant_id: &Uuid) -> Option<i64> {
+        self.lags.get(participant_id).copied()
+    }
+}
+
+/// A room whose live has started, carrying the start time announced by the
+/// host.
+pub struct LiveRoom {
+    host: Host,
+    song: CompleteSongData,
+    participants: HashMap<Uuid, Participant>,
+    /// Determined per-participant latency in microseconds
+    /// (detected sound time minus host sound time).
+    // Carried over from the host-joined state; nothing consumes it yet.
+    #[allow(dead_code)]
+    lags: HashMap<Uuid, i64>,
+    /// Start time of the live (unix microseconds), announced by the host.
+    start_time: u64,
+}
+
+impl LiveRoom {
+    pub fn host(&self) -> &Host {
+        &self.host
+    }
+
+    pub fn song(&self) -> &CompleteSongData {
+        &self.song
+    }
+
+    /// The live start time (unix microseconds) announced by the host.
+    pub fn start_time(&self) -> u64 {
+        self.start_time
     }
 
     #[cfg(test)]
@@ -311,12 +363,19 @@ pub enum ClientMessage {
     Stamp {
         stamp_id: u8,
     },
+    /// Host: announces the start time of the live (unix microseconds) and
+    /// transitions the room to live. The server broadcasts the start time to
+    /// every participant. Idempotent: a repeated announcement does not
+    /// retrigger the broadcast.
+    LiveStart {
+        start_time: u64,
+    },
 }
 
 /// Message sent from the server to the client over WebTransport.
 ///
 /// The wire encoding is defined in [`crate::domain::wire`].
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum ServerMessage {
     Joined {
         participant_id: Uuid,
@@ -345,6 +404,13 @@ pub enum ServerMessage {
     ParticipantStamp {
         participant_id: Uuid,
         stamp_id: u8,
+    },
+    /// Participants: the live has started. Carries the start time (unix
+    /// microseconds) announced by the host. Sent on a server-initiated
+    /// bidirectional stream, once per room (a repeated announcement does not
+    /// retrigger the broadcast).
+    LiveStarted {
+        start_time: u64,
     },
 }
 

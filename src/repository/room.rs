@@ -34,7 +34,8 @@ impl RoomRepository {
     }
 
     /// Registers a participant in the room. Returns an error if the room does
-    /// not exist or its host has not joined yet.
+    /// not exist, its host has not joined yet, or the live has already
+    /// started.
     pub fn insert_participant(
         &self,
         room_id: &str,
@@ -43,13 +44,18 @@ impl RoomRepository {
     ) -> Result<(), InsertParticipantError> {
         let mut map = self.inner.write();
         match map.get_mut(room_id) {
-            Some(room) => match room.participants_mut() {
-                Some(participants) => {
-                    participants.insert(participant_id, Participant::new(connection));
-                    Ok(())
+            Some(room) => {
+                if matches!(room, Room::Live(_)) {
+                    return Err(InsertParticipantError::LiveStarted);
                 }
-                None => Err(InsertParticipantError::HostNotJoined),
-            },
+                match room.participants_mut() {
+                    Some(participants) => {
+                        participants.insert(participant_id, Participant::new(connection));
+                        Ok(())
+                    }
+                    None => Err(InsertParticipantError::HostNotJoined),
+                }
+            }
             None => Err(InsertParticipantError::RoomNotFound),
         }
     }
@@ -90,7 +96,7 @@ impl RoomRepository {
                     Err(InsertHostError::InvalidToken)
                 }
             }
-            Some(Room::HostJoined(_)) => Err(InsertHostError::HostAlreadyJoined),
+            Some(Room::HostJoined(_) | Room::Live(_)) => Err(InsertHostError::HostAlreadyJoined),
             None => Err(InsertHostError::RoomNotFound),
         }
     }
@@ -106,7 +112,7 @@ impl RoomRepository {
         let mut map = self.inner.write();
         let waiting = match map.remove(room_id) {
             Some(Room::Waiting(waiting)) => waiting,
-            Some(room @ Room::HostJoined(_)) => {
+            Some(room @ (Room::HostJoined(_) | Room::Live(_))) => {
                 map.insert(room_id.to_string(), room);
                 return Err(InsertHostError::HostAlreadyJoined);
             }
@@ -128,13 +134,58 @@ impl RoomRepository {
     pub fn host_connection(&self, room_id: &str) -> Option<wtransport::Connection> {
         match self.inner.read().get(room_id) {
             Some(Room::HostJoined(joined)) => Some(joined.host().connection().clone()),
+            Some(Room::Live(live)) => Some(live.host().connection().clone()),
             _ => None,
         }
+    }
+
+    /// Returns clones of the room participants' connections, along with their
+    /// ids. `None` if the room does not exist or its host has not joined yet.
+    pub fn participant_connections(
+        &self,
+        room_id: &str,
+    ) -> Option<Vec<(Uuid, wtransport::Connection)>> {
+        self.inner
+            .read()
+            .get(room_id)
+            .and_then(Room::participants)
+            .map(|participants| {
+                participants
+                    .iter()
+                    .map(|(id, participant)| (*id, participant.connection().clone()))
+                    .collect()
+            })
     }
 
     /// Removes and returns the room. Returns `None` if the room does not exist.
     pub fn remove_room(&self, room_id: &str) -> Option<Room> {
         self.inner.write().remove(room_id)
+    }
+
+    /// Transitions the room to live with the given start time (unix
+    /// microseconds) announced by the host. Returns an error if the room does
+    /// not exist, its host has not joined yet, or the live has already
+    /// started.
+    pub fn start_live(&self, room_id: &str, start_time: u64) -> Result<(), StartLiveError> {
+        let mut map = self.inner.write();
+        match map.remove(room_id) {
+            Some(Room::HostJoined(joined)) => {
+                map.insert(
+                    room_id.to_string(),
+                    Room::Live(Box::new(joined.start_live(start_time))),
+                );
+                Ok(())
+            }
+            Some(room @ Room::Waiting(_)) => {
+                map.insert(room_id.to_string(), room);
+                Err(StartLiveError::HostNotJoined)
+            }
+            Some(room @ Room::Live(_)) => {
+                map.insert(room_id.to_string(), room);
+                Err(StartLiveError::AlreadyLive)
+            }
+            None => Err(StartLiveError::RoomNotFound),
+        }
     }
 
     /// Starts (or restarts) a latency calibration round with the given host
@@ -203,6 +254,15 @@ impl RoomRepository {
     pub fn host_id(&self, room_id: &str) -> Option<Uuid> {
         match self.inner.read().get(room_id) {
             Some(Room::HostJoined(joined)) => Some(joined.host().id()),
+            Some(Room::Live(live)) => Some(live.host().id()),
+            _ => None,
+        }
+    }
+
+    #[cfg(test)]
+    pub fn start_time(&self, room_id: &str) -> Option<u64> {
+        match self.inner.read().get(room_id) {
+            Some(Room::Live(live)) => Some(live.start_time()),
             _ => None,
         }
     }
@@ -211,6 +271,7 @@ impl RoomRepository {
     pub fn participant_lag(&self, room_id: &str, participant_id: &Uuid) -> Option<i64> {
         match self.inner.read().get(room_id) {
             Some(Room::HostJoined(joined)) => joined.lag(participant_id),
+            Some(Room::Live(live)) => live.lag(participant_id),
             _ => None,
         }
     }
@@ -232,6 +293,8 @@ pub enum InsertParticipantError {
     RoomNotFound,
     #[error("host has not joined yet")]
     HostNotJoined,
+    #[error("live has already started")]
+    LiveStarted,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -252,6 +315,16 @@ pub enum InsertHostError {
     InvalidToken,
     #[error("host already joined")]
     HostAlreadyJoined,
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum StartLiveError {
+    #[error("room not found")]
+    RoomNotFound,
+    #[error("host has not joined yet")]
+    HostNotJoined,
+    #[error("live has already started")]
+    AlreadyLive,
 }
 
 #[derive(Debug, thiserror::Error)]

@@ -187,6 +187,11 @@ impl WebTransportServer {
                 connection.close(wtransport::VarInt::from_u32(403), b"host has not joined");
                 return;
             }
+            Err(InsertParticipantError::LiveStarted) => {
+                warn!(room_id = %room_id, "live has already started after accept, closing connection");
+                connection.close(wtransport::VarInt::from_u32(403), b"live already started");
+                return;
+            }
         };
 
         info!(room_id = %room_id, participant_id = %participant_id, "participant joined");
@@ -230,6 +235,52 @@ async fn notify_host(room_service: RoomService, room_id: String, message: Server
         Err(e) => {
             warn!(room_id = %room_id, message = ?message, error = %e, "failed to notify host");
         }
+    }
+}
+
+/// Pushes a server-initiated event to every participant of the room, each on
+/// its own server-initiated bidirectional stream.
+///
+/// Fire-and-forget: a missing room (e.g. removed concurrently) skips the
+/// broadcast, and any transport failure is only logged.
+async fn notify_participants(room_service: RoomService, room_id: String, message: ServerMessage) {
+    let Some(participants) = room_service.participant_connections(&room_id) else {
+        debug!(room_id = %room_id, "room is not available, skipping participant notification");
+        return;
+    };
+
+    for (participant_id, connection) in participants {
+        // Each participant is notified on its own task so that a stalled
+        // connection does not delay the others.
+        let room_id = room_id.clone();
+        let message = message.clone();
+        tokio::spawn(async move {
+            let result = async {
+                let (mut send_stream, _recv_stream) = connection.open_bi().await?.await?;
+                send_message(&mut send_stream, &message).await
+            }
+            .await;
+
+            match result {
+                Ok(()) => {
+                    info!(
+                        room_id = %room_id,
+                        participant_id = %participant_id,
+                        message = ?message,
+                        "notified participant"
+                    );
+                }
+                Err(e) => {
+                    warn!(
+                        room_id = %room_id,
+                        participant_id = %participant_id,
+                        message = ?message,
+                        error = %e,
+                        "failed to notify participant"
+                    );
+                }
+            }
+        });
     }
 }
 
@@ -364,6 +415,13 @@ async fn handle_bi_stream(
             // Fire-and-forget: the server relays the stamp to the host and
             // never responds.
             handle_stamp(room_service, room_id, client_id, is_host, stamp_id);
+            None
+        }
+        Ok(ClientMessage::LiveStart { start_time }) => {
+            // Fire-and-forget: the server transitions the room to live and
+            // broadcasts the start time to every participant; it never
+            // responds.
+            handle_live_start(room_service, room_id, client_id, is_host, start_time);
             None
         }
         Err(e) => {
@@ -506,6 +564,37 @@ fn handle_calibration_detect(
     }
 }
 
+/// Transitions the room to live with the announced start time and broadcasts
+/// the start time to every participant on a server-initiated bidirectional
+/// stream.
+fn handle_live_start(
+    room_service: &RoomService,
+    room_id: &str,
+    client_id: Uuid,
+    is_host: bool,
+    start_time: u64,
+) {
+    if !is_host {
+        warn!(
+            room_id = %room_id,
+            participant_id = %client_id,
+            "ignoring live start from a non-host client"
+        );
+        return;
+    }
+    if let Err(e) = room_service.start_live(room_id, start_time) {
+        warn!(room_id = %room_id, error = %e, "failed to start live");
+        return;
+    }
+    // Fire-and-forget: the start flow must not block on (or fail with) the
+    // broadcast.
+    tokio::spawn(notify_participants(
+        room_service.clone(),
+        room_id.to_string(),
+        ServerMessage::LiveStarted { start_time },
+    ));
+}
+
 /// Current wall-clock time in microseconds since the Unix epoch.
 fn unix_micros() -> u64 {
     SystemTime::now()
@@ -635,6 +724,9 @@ mod tests {
             ServerMessage::ParticipantStamp { .. } => {
                 panic!("unexpected participant stamp notification")
             }
+            ServerMessage::LiveStarted { .. } => {
+                panic!("unexpected live started notification")
+            }
         }
     }
 
@@ -657,6 +749,20 @@ mod tests {
         let mut response = Vec::new();
         recv.read_to_end(&mut response).await.expect("read_to_end");
         response
+    }
+
+    /// Receives one server-initiated message from the given connection.
+    async fn recv_server_message(connection: &wtransport::Connection) -> ServerMessage {
+        let (_send_stream, mut recv_stream) = connection
+            .accept_bi()
+            .await
+            .expect("server-initiated stream accepted");
+        let mut buf = Vec::new();
+        recv_stream
+            .read_to_end(&mut buf)
+            .await
+            .expect("read_to_end");
+        decode_exact::<ServerMessage>(&buf).expect("valid server message")
     }
 
     #[tokio::test]
@@ -1512,6 +1618,225 @@ mod tests {
 
         host.close(wtransport::VarInt::from_u32(0), b"done");
         participant.close(wtransport::VarInt::from_u32(0), b"done");
+    }
+
+    #[tokio::test]
+    async fn test_webtransport_live_start_broadcasts_to_participants() {
+        let room_id = "9393";
+        let (room_repo, room_service) = setup_room_service(room_id);
+
+        let (server_port, cert_hash) = start_server(room_service).await;
+        let client = test_client(cert_hash);
+
+        let host = client
+            .connect(format!(
+                "https://127.0.0.1:{server_port}/rooms/{room_id}?hostToken={HOST_TOKEN}"
+            ))
+            .await
+            .expect("connect as host");
+        sleep(Duration::from_millis(200)).await;
+
+        let first = client
+            .connect(format!("https://127.0.0.1:{server_port}/rooms/{room_id}"))
+            .await
+            .expect("connect as first participant");
+        join_as_participant(&first).await;
+        let second = client
+            .connect(format!("https://127.0.0.1:{server_port}/rooms/{room_id}"))
+            .await
+            .expect("connect as second participant");
+        join_as_participant(&second).await;
+
+        // Drain the participant-joined notifications first.
+        for _ in 0..2 {
+            assert!(matches!(
+                recv_server_message(&host).await,
+                ServerMessage::ParticipantJoined { .. }
+            ));
+        }
+
+        // The host announces the live start time.
+        let start_time = 1_700_000_000_000_000;
+        let response = send_client_message(&host, &ClientMessage::LiveStart { start_time }).await;
+        assert!(response.is_empty(), "live start must not get a response");
+        assert_eq!(room_repo.start_time(room_id), Some(start_time));
+
+        // Every participant is notified on a server-initiated stream.
+        for participant in [&first, &second] {
+            match recv_server_message(participant).await {
+                ServerMessage::LiveStarted {
+                    start_time: notified,
+                } => assert_eq!(notified, start_time),
+                other => panic!("unexpected message: {other:?}"),
+            }
+        }
+
+        // The host itself is not notified.
+        let result = timeout(Duration::from_millis(300), host.accept_bi()).await;
+        assert!(
+            result.is_err(),
+            "the host must not be notified of the live start"
+        );
+
+        host.close(wtransport::VarInt::from_u32(0), b"done");
+        first.close(wtransport::VarInt::from_u32(0), b"done");
+        second.close(wtransport::VarInt::from_u32(0), b"done");
+    }
+
+    #[tokio::test]
+    async fn test_webtransport_live_start_from_non_host_ignored() {
+        let room_id = "9494";
+        let (room_repo, room_service) = setup_room_service(room_id);
+
+        let (server_port, cert_hash) = start_server(room_service).await;
+        let client = test_client(cert_hash);
+
+        let host = client
+            .connect(format!(
+                "https://127.0.0.1:{server_port}/rooms/{room_id}?hostToken={HOST_TOKEN}"
+            ))
+            .await
+            .expect("connect as host");
+        sleep(Duration::from_millis(200)).await;
+
+        let participant = client
+            .connect(format!("https://127.0.0.1:{server_port}/rooms/{room_id}"))
+            .await
+            .expect("connect as participant");
+        join_as_participant(&participant).await;
+
+        // Drain the participant-joined notification first.
+        assert!(matches!(
+            recv_server_message(&host).await,
+            ServerMessage::ParticipantJoined { .. }
+        ));
+
+        // A live start from a participant is ignored.
+        let response = send_client_message(
+            &participant,
+            &ClientMessage::LiveStart {
+                start_time: 1_700_000_000_000_000,
+            },
+        )
+        .await;
+        assert!(response.is_empty());
+        let result = timeout(Duration::from_millis(300), participant.accept_bi()).await;
+        assert!(result.is_err(), "non-host live start must not broadcast");
+
+        // The room stays in the host-joined state.
+        assert_eq!(room_repo.start_time(room_id), None);
+        assert!(room_repo.host_id(room_id).is_some());
+
+        host.close(wtransport::VarInt::from_u32(0), b"done");
+        participant.close(wtransport::VarInt::from_u32(0), b"done");
+    }
+
+    #[tokio::test]
+    async fn test_webtransport_live_start_duplicate_ignored() {
+        let room_id = "9595";
+        let (room_repo, room_service) = setup_room_service(room_id);
+
+        let (server_port, cert_hash) = start_server(room_service).await;
+        let client = test_client(cert_hash);
+
+        let host = client
+            .connect(format!(
+                "https://127.0.0.1:{server_port}/rooms/{room_id}?hostToken={HOST_TOKEN}"
+            ))
+            .await
+            .expect("connect as host");
+        sleep(Duration::from_millis(200)).await;
+
+        let first = client
+            .connect(format!("https://127.0.0.1:{server_port}/rooms/{room_id}"))
+            .await
+            .expect("connect as first participant");
+        join_as_participant(&first).await;
+        let second = client
+            .connect(format!("https://127.0.0.1:{server_port}/rooms/{room_id}"))
+            .await
+            .expect("connect as second participant");
+        join_as_participant(&second).await;
+
+        // Drain the participant-joined notifications first.
+        for _ in 0..2 {
+            assert!(matches!(
+                recv_server_message(&host).await,
+                ServerMessage::ParticipantJoined { .. }
+            ));
+        }
+
+        let first_start_time = 1_700_000_000_000_000;
+        let response = send_client_message(
+            &host,
+            &ClientMessage::LiveStart {
+                start_time: first_start_time,
+            },
+        )
+        .await;
+        assert!(response.is_empty());
+
+        for participant in [&first, &second] {
+            match recv_server_message(participant).await {
+                ServerMessage::LiveStarted {
+                    start_time: notified,
+                } => assert_eq!(notified, first_start_time),
+                other => panic!("unexpected message: {other:?}"),
+            }
+        }
+
+        // A repeated announcement does not retrigger the broadcast.
+        let response = send_client_message(
+            &host,
+            &ClientMessage::LiveStart {
+                start_time: 1_700_000_001_000_000,
+            },
+        )
+        .await;
+        assert!(response.is_empty());
+        for participant in [&first, &second] {
+            let result = timeout(Duration::from_millis(300), participant.accept_bi()).await;
+            assert!(result.is_err(), "duplicate live start must not broadcast");
+        }
+        assert_eq!(room_repo.start_time(room_id), Some(first_start_time));
+
+        host.close(wtransport::VarInt::from_u32(0), b"done");
+        first.close(wtransport::VarInt::from_u32(0), b"done");
+        second.close(wtransport::VarInt::from_u32(0), b"done");
+    }
+
+    #[tokio::test]
+    async fn test_webtransport_participant_rejected_after_live_start() {
+        let room_id = "9696";
+        let (room_repo, room_service) = setup_room_service(room_id);
+
+        let (server_port, cert_hash) = start_server(room_service).await;
+        let client = test_client(cert_hash);
+
+        let host = client
+            .connect(format!(
+                "https://127.0.0.1:{server_port}/rooms/{room_id}?hostToken={HOST_TOKEN}"
+            ))
+            .await
+            .expect("connect as host");
+        sleep(Duration::from_millis(200)).await;
+
+        // The host announces the live start time.
+        let start_time = 1_700_000_000_000_000;
+        let response = send_client_message(&host, &ClientMessage::LiveStart { start_time }).await;
+        assert!(response.is_empty());
+        assert_eq!(room_repo.start_time(room_id), Some(start_time));
+
+        // Participants may not join once the live has started.
+        let result = client
+            .connect(format!("https://127.0.0.1:{server_port}/rooms/{room_id}"))
+            .await;
+        assert!(
+            result.is_err(),
+            "expected connect to fail after the live started"
+        );
+
+        host.close(wtransport::VarInt::from_u32(0), b"done");
     }
 
     #[test]
