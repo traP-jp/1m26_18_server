@@ -20,7 +20,7 @@ use wtransport::{
 
 use crate::{
     domain::{
-        room::{CALIBRATION_SOUND_COUNT, ClientMessage, SYNC_REPORT_DELAY_US, ServerMessage},
+        room::{ClientMessage, SYNC_REPORT_DELAY_US, ServerMessage},
         wire::{Encode, EncodeError, decode_exact},
     },
     repository::room::{InsertHostError, InsertParticipantError},
@@ -452,28 +452,6 @@ async fn handle_bi_stream(
             let t2 = unix_micros();
             Some(ServerMessage::TimeSyncResponse { t1, t2 })
         }
-        Ok(ClientMessage::CalibrationStart { times }) => {
-            // Fire-and-forget: the server stores the announced sound times and
-            // never responds.
-            handle_calibration_start(room_service, room_id, client_id, is_host, times);
-            None
-        }
-        Ok(ClientMessage::CalibrationDetect {
-            sound_index,
-            detected_at,
-        }) => {
-            // Fire-and-forget: the server matches the detection and stores the
-            // per-participant lag; it is never reported back to the client.
-            handle_calibration_detect(
-                room_service,
-                room_id,
-                client_id,
-                is_host,
-                sound_index,
-                detected_at,
-            );
-            None
-        }
         Ok(ClientMessage::Ready) => {
             // Fire-and-forget: the server records the participant's readiness
             // and never responds; the host is notified on the first report.
@@ -528,26 +506,6 @@ async fn handle_bi_stream(
     }
 
     Ok(())
-}
-
-fn handle_calibration_start(
-    room_service: &RoomService,
-    room_id: &str,
-    client_id: Uuid,
-    is_host: bool,
-    times: [u64; CALIBRATION_SOUND_COUNT],
-) {
-    if !is_host {
-        warn!(
-            room_id = %room_id,
-            participant_id = %client_id,
-            "ignoring calibration start from a non-host client"
-        );
-        return;
-    }
-    if let Err(e) = room_service.start_calibration(room_id, times) {
-        warn!(room_id = %room_id, error = %e, "failed to start calibration");
-    }
 }
 
 /// Records a participant's ready report and, on the first transition,
@@ -653,34 +611,6 @@ fn handle_color_change(
     ));
 }
 
-fn handle_calibration_detect(
-    room_service: &RoomService,
-    room_id: &str,
-    participant_id: Uuid,
-    is_host: bool,
-    sound_index: usize,
-    detected_at: u64,
-) {
-    if is_host {
-        warn!(
-            room_id = %room_id,
-            host_id = %participant_id,
-            "ignoring calibration sound detection from the host"
-        );
-        return;
-    }
-    if let Err(e) =
-        room_service.record_detection(room_id, &participant_id, sound_index, detected_at)
-    {
-        warn!(
-            room_id = %room_id,
-            participant_id = %participant_id,
-            error = %e,
-            "failed to record calibration sound detection"
-        );
-    }
-}
-
 /// Transitions the room to live with the announced start time and broadcasts
 /// the start time to every participant on a server-initiated bidirectional
 /// stream.
@@ -719,8 +649,7 @@ fn handle_live_start(
 }
 
 /// Records a participant's device-shake report (sent unreliably as a
-/// datagram) for per-beat sync-rate calculation. Reports from participants
-/// without a determined lag are excluded from the calculation.
+/// datagram) for per-beat sync-rate calculation.
 fn handle_shake(
     room_service: &RoomService,
     room_id: &str,
@@ -1139,293 +1068,6 @@ mod tests {
         sleep(Duration::from_millis(300)).await;
         assert_eq!(room_repo.participant_count(room_id), Some(0));
         host.close(wtransport::VarInt::from_u32(0), b"done");
-    }
-
-    #[tokio::test]
-    async fn test_webtransport_calibration_flow() {
-        let room_id = "3131";
-        let (room_repo, room_service) = setup_room_service(room_id);
-
-        let (server_port, cert_hash) = start_server(room_service).await;
-        let client = test_client(cert_hash);
-
-        let host = client
-            .connect(format!(
-                "https://127.0.0.1:{server_port}/rooms/{room_id}?hostToken={HOST_TOKEN}"
-            ))
-            .await
-            .expect("connect as host");
-        sleep(Duration::from_millis(200)).await;
-        let participant = client
-            .connect(format!("https://127.0.0.1:{server_port}/rooms/{room_id}"))
-            .await
-            .expect("connect as participant");
-        let participant_id = join_as_participant(&participant).await;
-
-        let host_times = [
-            1_700_000_000_000_000,
-            1_700_000_001_000_000,
-            1_700_000_002_000_000,
-        ];
-        let response = send_client_message(
-            &host,
-            &ClientMessage::CalibrationStart { times: host_times },
-        )
-        .await;
-        assert!(
-            response.is_empty(),
-            "calibration start must not get a response"
-        );
-
-        // Detections are reported in a shuffled order (clients distinguish the
-        // sounds by frequency), each lagging its sound by a different amount;
-        // the lag is the median difference (60_000 µs).
-        let detections = [
-            (2, 1_700_000_002_000_000 + 70_000),
-            (0, 1_700_000_000_000_000 + 50_000),
-            (1, 1_700_000_001_000_000 + 60_000),
-        ];
-        for (sound_index, detected_at) in detections {
-            let response = send_client_message(
-                &participant,
-                &ClientMessage::CalibrationDetect {
-                    sound_index,
-                    detected_at,
-                },
-            )
-            .await;
-            assert!(
-                response.is_empty(),
-                "calibration detect must not get a response"
-            );
-        }
-
-        assert_eq!(
-            room_repo.participant_lag(room_id, &participant_id),
-            Some(60_000)
-        );
-
-        host.close(wtransport::VarInt::from_u32(0), b"done");
-        participant.close(wtransport::VarInt::from_u32(0), b"done");
-    }
-
-    #[tokio::test]
-    async fn test_webtransport_calibration_detect_before_start_ignored() {
-        let room_id = "3232";
-        let (room_repo, room_service) = setup_room_service(room_id);
-
-        let (server_port, cert_hash) = start_server(room_service).await;
-        let client = test_client(cert_hash);
-
-        let host = client
-            .connect(format!(
-                "https://127.0.0.1:{server_port}/rooms/{room_id}?hostToken={HOST_TOKEN}"
-            ))
-            .await
-            .expect("connect as host");
-        sleep(Duration::from_millis(200)).await;
-        let participant = client
-            .connect(format!("https://127.0.0.1:{server_port}/rooms/{room_id}"))
-            .await
-            .expect("connect as participant");
-        let participant_id = join_as_participant(&participant).await;
-
-        // A detection with no calibration in progress is silently ignored.
-        let response = send_client_message(
-            &participant,
-            &ClientMessage::CalibrationDetect {
-                sound_index: 0,
-                detected_at: 1_700_000_000_050_000,
-            },
-        )
-        .await;
-        assert!(response.is_empty());
-        assert_eq!(room_repo.participant_lag(room_id, &participant_id), None);
-
-        // The flow still works once the host has started a calibration round.
-        let host_times = [
-            1_700_000_000_000_000,
-            1_700_000_001_000_000,
-            1_700_000_002_000_000,
-        ];
-        send_client_message(
-            &host,
-            &ClientMessage::CalibrationStart { times: host_times },
-        )
-        .await;
-        for (sound_index, lag) in [50_000u64, 60_000, 70_000].into_iter().enumerate() {
-            send_client_message(
-                &participant,
-                &ClientMessage::CalibrationDetect {
-                    sound_index,
-                    detected_at: host_times[sound_index] + lag,
-                },
-            )
-            .await;
-        }
-
-        assert_eq!(
-            room_repo.participant_lag(room_id, &participant_id),
-            Some(60_000)
-        );
-
-        host.close(wtransport::VarInt::from_u32(0), b"done");
-        participant.close(wtransport::VarInt::from_u32(0), b"done");
-    }
-
-    #[tokio::test]
-    async fn test_webtransport_calibration_wrong_senders_ignored() {
-        let room_id = "3434";
-        let (room_repo, room_service) = setup_room_service(room_id);
-
-        let (server_port, cert_hash) = start_server(room_service).await;
-        let client = test_client(cert_hash);
-
-        let host = client
-            .connect(format!(
-                "https://127.0.0.1:{server_port}/rooms/{room_id}?hostToken={HOST_TOKEN}"
-            ))
-            .await
-            .expect("connect as host");
-        let host_id = {
-            sleep(Duration::from_millis(200)).await;
-            room_repo.host_id(room_id).expect("host registered")
-        };
-        let participant = client
-            .connect(format!("https://127.0.0.1:{server_port}/rooms/{room_id}"))
-            .await
-            .expect("connect as participant");
-        let participant_id = join_as_participant(&participant).await;
-
-        // A non-host client must not be able to start a calibration round.
-        let host_times = [
-            1_700_000_000_000_000,
-            1_700_000_001_000_000,
-            1_700_000_002_000_000,
-        ];
-        send_client_message(
-            &participant,
-            &ClientMessage::CalibrationStart { times: host_times },
-        )
-        .await;
-        // The host must not report sound detections.
-        send_client_message(
-            &host,
-            &ClientMessage::CalibrationDetect {
-                sound_index: 0,
-                detected_at: 1_700_000_000_050_000,
-            },
-        )
-        .await;
-        sleep(Duration::from_millis(100)).await;
-        assert_eq!(room_repo.participant_lag(room_id, &participant_id), None);
-        assert_eq!(room_repo.participant_lag(room_id, &host_id), None);
-
-        // The connections remain usable: a proper host-initiated round works.
-        send_client_message(
-            &host,
-            &ClientMessage::CalibrationStart { times: host_times },
-        )
-        .await;
-        for (sound_index, sound) in host_times.into_iter().enumerate() {
-            send_client_message(
-                &participant,
-                &ClientMessage::CalibrationDetect {
-                    sound_index,
-                    detected_at: sound + 60_000,
-                },
-            )
-            .await;
-        }
-
-        assert_eq!(
-            room_repo.participant_lag(room_id, &participant_id),
-            Some(60_000)
-        );
-
-        host.close(wtransport::VarInt::from_u32(0), b"done");
-        participant.close(wtransport::VarInt::from_u32(0), b"done");
-    }
-
-    #[tokio::test]
-    async fn test_webtransport_calibration_duplicate_and_invalid_index_ignored() {
-        let room_id = "3535";
-        let (room_repo, room_service) = setup_room_service(room_id);
-
-        let (server_port, cert_hash) = start_server(room_service).await;
-        let client = test_client(cert_hash);
-
-        let host = client
-            .connect(format!(
-                "https://127.0.0.1:{server_port}/rooms/{room_id}?hostToken={HOST_TOKEN}"
-            ))
-            .await
-            .expect("connect as host");
-        sleep(Duration::from_millis(200)).await;
-        let participant = client
-            .connect(format!("https://127.0.0.1:{server_port}/rooms/{room_id}"))
-            .await
-            .expect("connect as participant");
-        let participant_id = join_as_participant(&participant).await;
-
-        let host_times = [
-            1_700_000_000_000_000,
-            1_700_000_001_000_000,
-            1_700_000_002_000_000,
-        ];
-        send_client_message(
-            &host,
-            &ClientMessage::CalibrationStart { times: host_times },
-        )
-        .await;
-
-        // Sound 0 is reported twice; the first report (lag 50_000 µs) must win.
-        send_client_message(
-            &participant,
-            &ClientMessage::CalibrationDetect {
-                sound_index: 0,
-                detected_at: host_times[0] + 50_000,
-            },
-        )
-        .await;
-        send_client_message(
-            &participant,
-            &ClientMessage::CalibrationDetect {
-                sound_index: 0,
-                detected_at: host_times[0] + 550_000,
-            },
-        )
-        .await;
-        // An out-of-range index is ignored.
-        send_client_message(
-            &participant,
-            &ClientMessage::CalibrationDetect {
-                sound_index: CALIBRATION_SOUND_COUNT,
-                detected_at: host_times[0] + 550_000,
-            },
-        )
-        .await;
-
-        for (sound_index, lag) in [60_000u64, 120_000].into_iter().enumerate() {
-            send_client_message(
-                &participant,
-                &ClientMessage::CalibrationDetect {
-                    sound_index: sound_index + 1,
-                    detected_at: host_times[sound_index + 1] + lag,
-                },
-            )
-            .await;
-        }
-
-        // First-wins for sound 0 gives diffs (50_000, 60_000, 120_000) whose
-        // median is 60_000; an overwritten report would give 120_000.
-        assert_eq!(
-            room_repo.participant_lag(room_id, &participant_id),
-            Some(60_000)
-        );
-
-        host.close(wtransport::VarInt::from_u32(0), b"done");
-        participant.close(wtransport::VarInt::from_u32(0), b"done");
     }
 
     #[tokio::test]
@@ -2229,35 +1871,6 @@ mod tests {
         );
     }
 
-    /// Calibrates the participant against the host sound times with the
-    /// detections used by the calibration flow tests (median lag 60_000 µs).
-    async fn calibrate_participant(
-        host: &wtransport::Connection,
-        participant: &wtransport::Connection,
-    ) {
-        let host_times = [
-            1_700_000_000_000_000,
-            1_700_000_001_000_000,
-            1_700_000_002_000_000,
-        ];
-        send_client_message(host, &ClientMessage::CalibrationStart { times: host_times }).await;
-        let detections = [
-            (2, 1_700_000_002_000_000 + 70_000),
-            (0, 1_700_000_000_000_000 + 50_000),
-            (1, 1_700_000_001_000_000 + 60_000),
-        ];
-        for (sound_index, detected_at) in detections {
-            send_client_message(
-                participant,
-                &ClientMessage::CalibrationDetect {
-                    sound_index,
-                    detected_at,
-                },
-            )
-            .await;
-        }
-    }
-
     #[tokio::test]
     async fn test_webtransport_shake_reports_sync_rate_to_host() {
         let room_id = "9797";
@@ -2280,21 +1893,16 @@ mod tests {
             .await
             .expect("connect as participant");
         let participant_id = join_as_participant(&participant).await;
-        calibrate_participant(&host, &participant).await;
-        assert_eq!(
-            room_repo.participant_lag(room_id, &participant_id),
-            Some(60_000)
-        );
 
         // The host announces the live start; the participant shakes exactly
-        // on beat 0 (after lag correction).
+        // on beat 0.
         let start_time = unix_micros() + 1_000_000;
         let response = send_client_message(&host, &ClientMessage::LiveStart { start_time }).await;
         assert!(response.is_empty());
         send_datagram(
             &participant,
             &ClientMessage::Shake {
-                detected_at: start_time + 60_000,
+                detected_at: start_time,
             },
         );
 
@@ -2323,7 +1931,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_webtransport_shake_without_lag_and_host_shake_ignored() {
+    async fn test_webtransport_host_shake_ignored() {
         let room_id = "9898";
         let (room_repo, room_service) =
             setup_room_service_with_song(room_id, song_with_beats(&[0.0, 500.0]));
@@ -2345,14 +1953,11 @@ mod tests {
             .expect("connect as participant");
         let participant_id = join_as_participant(&participant).await;
 
-        // No calibration: the participant's lag is unknown.
-
         let start_time = unix_micros() + 1_000_000;
         let response = send_client_message(&host, &ClientMessage::LiveStart { start_time }).await;
         assert!(response.is_empty());
 
-        // The participant shakes exactly on beat 0, but its lag is unknown,
-        // so the report must be excluded (not even recorded).
+        // The participant shakes exactly on beat 0.
         send_datagram(
             &participant,
             &ClientMessage::Shake {
@@ -2362,10 +1967,10 @@ mod tests {
         sleep(Duration::from_millis(100)).await;
         assert_eq!(
             room_repo.participant_shake_count(room_id, &participant_id),
-            None
+            Some(1)
         );
 
-        // A shake sent by the host is ignored as well.
+        // A shake sent by the host is ignored.
         send_datagram(
             &host,
             &ClientMessage::Shake {
@@ -2373,12 +1978,16 @@ mod tests {
             },
         );
 
-        // No sync-rate report is sent for either beat.
-        let result = timeout(Duration::from_millis(1800), recv_datagram(&host)).await;
+        // The beat-0 report arrives; beat 1 has no shakes and is skipped.
+        let message = timeout(Duration::from_secs(5), recv_datagram(&host))
+            .await
+            .expect("sync-rate report for beat 0");
         assert!(
-            result.is_err(),
-            "shakes of unknown-lag participants must not trigger reports"
+            matches!(message, ServerMessage::SyncRate { rate: 100 }),
+            "a shake exactly on the beat must score 100, got {message:?}"
         );
+        let result = timeout(Duration::from_millis(800), recv_datagram(&host)).await;
+        assert!(result.is_err(), "beats without shakes must not be reported");
 
         host.close(wtransport::VarInt::from_u32(0), b"done");
         participant.close(wtransport::VarInt::from_u32(0), b"done");
@@ -2387,7 +1996,7 @@ mod tests {
     #[tokio::test]
     async fn test_webtransport_shake_before_live_not_recorded() {
         let room_id = "9998";
-        let (room_repo, room_service) =
+        let (_room_repo, room_service) =
             setup_room_service_with_song(room_id, song_with_beats(&[0.0]));
 
         let (server_port, cert_hash) = start_server(room_service).await;
@@ -2405,21 +2014,15 @@ mod tests {
             .connect(format!("https://127.0.0.1:{server_port}/rooms/{room_id}"))
             .await
             .expect("connect as participant");
-        let participant_id = join_as_participant(&participant).await;
-        calibrate_participant(&host, &participant).await;
-        assert_eq!(
-            room_repo.participant_lag(room_id, &participant_id),
-            Some(60_000)
-        );
+        join_as_participant(&participant).await;
 
-        // A shake reported before the live starts is not recorded; its
-        // lag-corrected time is 80 ms off the beat (a score of 20 if it
-        // were).
+        // A shake reported before the live starts is not recorded; it is
+        // 80 ms off the beat (a score of 20 if it were counted).
         let start_time = unix_micros() + 1_000_000;
         send_datagram(
             &participant,
             &ClientMessage::Shake {
-                detected_at: start_time + 60_000 + 80_000,
+                detected_at: start_time + 80_000,
             },
         );
         sleep(Duration::from_millis(200)).await;
@@ -2432,7 +2035,7 @@ mod tests {
         send_datagram(
             &participant,
             &ClientMessage::Shake {
-                detected_at: start_time + 60_000,
+                detected_at: start_time,
             },
         );
 

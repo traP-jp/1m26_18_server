@@ -3,10 +3,7 @@ use std::{collections::HashMap, sync::Arc};
 use parking_lot::RwLock;
 use uuid::Uuid;
 
-use crate::domain::room::{
-    CALIBRATION_SOUND_COUNT, DetectionError, DetectionOutcome, Host, Participant, Room,
-    ShakeOutcome,
-};
+use crate::domain::room::{Host, Participant, Room, ShakeOutcome};
 
 #[derive(Clone, Default)]
 pub struct RoomRepository {
@@ -189,62 +186,7 @@ impl RoomRepository {
         }
     }
 
-    /// Starts (or restarts) a latency calibration round with the given host
-    /// sound times. Overwrites any in-progress round; already determined lags
-    /// are kept until they are determined again.
-    pub fn start_calibration(
-        &self,
-        room_id: &str,
-        host_times: [u64; CALIBRATION_SOUND_COUNT],
-    ) -> Result<(), CalibrationError> {
-        let mut map = self.inner.write();
-        match map.get_mut(room_id) {
-            Some(room) => {
-                let joined = room
-                    .host_joined_mut()
-                    .ok_or(CalibrationError::HostNotJoined)?;
-                joined.start_calibration(host_times);
-                Ok(())
-            }
-            None => Err(CalibrationError::RoomNotFound),
-        }
-    }
-
-    /// Records one participant sound detection (with the detected sound's
-    /// index) for the room's current calibration round. When the participant
-    /// has reported every host sound, the median difference is stored as
-    /// their lag.
-    pub fn record_detection(
-        &self,
-        room_id: &str,
-        participant_id: &Uuid,
-        sound_index: usize,
-        detected_at: u64,
-    ) -> Result<DetectionOutcome, CalibrationError> {
-        let mut map = self.inner.write();
-        match map.get_mut(room_id) {
-            Some(room) => {
-                let joined = room
-                    .host_joined_mut()
-                    .ok_or(CalibrationError::HostNotJoined)?;
-                let calibration = joined
-                    .calibration_mut()
-                    .ok_or(CalibrationError::NoActiveCalibration)?;
-                let outcome = calibration
-                    .record_detection(*participant_id, sound_index, detected_at)
-                    .map_err(CalibrationError::Detection)?;
-                if let DetectionOutcome::Completed { lag } = outcome {
-                    joined.insert_lag(*participant_id, lag);
-                }
-                Ok(outcome)
-            }
-            None => Err(CalibrationError::RoomNotFound),
-        }
-    }
-
-    /// Records one participant device-shake report. Reports are only
-    /// considered in sync-rate calculations for participants in the room
-    /// whose lag has been determined.
+    /// Records one participant device-shake report.
     pub fn record_shake(
         &self,
         room_id: &str,
@@ -258,7 +200,6 @@ impl RoomRepository {
                 match live.record_shake(participant_id, detected_at) {
                     ShakeOutcome::Recorded => Ok(()),
                     ShakeOutcome::UnknownParticipant => Err(ShakeError::ParticipantNotFound),
-                    ShakeOutcome::UnknownLag => Err(ShakeError::LagUnknown),
                 }
             }
             None => Err(ShakeError::RoomNotFound),
@@ -308,15 +249,6 @@ impl RoomRepository {
     pub fn start_time(&self, room_id: &str) -> Option<u64> {
         match self.inner.read().get(room_id) {
             Some(Room::Live(live)) => Some(live.start_time()),
-            _ => None,
-        }
-    }
-
-    #[cfg(test)]
-    pub fn participant_lag(&self, room_id: &str, participant_id: &Uuid) -> Option<i64> {
-        match self.inner.read().get(room_id) {
-            Some(Room::HostJoined(joined)) => joined.lag(participant_id),
-            Some(Room::Live(live)) => live.lag(participant_id),
             _ => None,
         }
     }
@@ -381,18 +313,6 @@ pub enum StartLiveError {
 }
 
 #[derive(Debug, thiserror::Error)]
-pub enum CalibrationError {
-    #[error("room not found")]
-    RoomNotFound,
-    #[error("host has not joined yet")]
-    HostNotJoined,
-    #[error("no calibration round in progress")]
-    NoActiveCalibration,
-    #[error("invalid sound detection: {0}")]
-    Detection(#[from] DetectionError),
-}
-
-#[derive(Debug, thiserror::Error)]
 pub enum ShakeError {
     #[error("room not found")]
     RoomNotFound,
@@ -400,6 +320,4 @@ pub enum ShakeError {
     NotLive,
     #[error("participant not found")]
     ParticipantNotFound,
-    #[error("participant lag is unknown")]
-    LagUnknown,
 }

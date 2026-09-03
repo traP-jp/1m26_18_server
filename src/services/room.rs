@@ -2,10 +2,10 @@ use rand::RngExt;
 use uuid::Uuid;
 
 use crate::domain::model::SongData;
-use crate::domain::room::{CALIBRATION_SOUND_COUNT, DetectionOutcome, Room, WaitingRoom};
+use crate::domain::room::{Room, WaitingRoom};
 use crate::repository::room::{
-    CalibrationError, InsertHostError, InsertParticipantError, RoomRepository, SetReadyError,
-    ShakeError, StartLiveError,
+    InsertHostError, InsertParticipantError, RoomRepository, SetReadyError, ShakeError,
+    StartLiveError,
 };
 use crate::services::song::{SongService, SongServiceError};
 
@@ -145,51 +145,8 @@ impl RoomService {
         self.repo.exists(room_id)
     }
 
-    /// Starts (or restarts) a latency calibration round announced by the host.
-    pub fn start_calibration(
-        &self,
-        room_id: &str,
-        host_times: [u64; CALIBRATION_SOUND_COUNT],
-    ) -> Result<(), CalibrationError> {
-        self.repo.start_calibration(room_id, host_times)?;
-        tracing::info!(room_id = %room_id, host_times = ?host_times, "calibration started");
-        Ok(())
-    }
-
-    /// Records one participant sound detection (with the detected sound's
-    /// index) for the current calibration round. Returns the determined lag
-    /// when all sounds have been reported.
-    pub fn record_detection(
-        &self,
-        room_id: &str,
-        participant_id: &Uuid,
-        sound_index: usize,
-        detected_at: u64,
-    ) -> Result<DetectionOutcome, CalibrationError> {
-        let outcome =
-            self.repo
-                .record_detection(room_id, participant_id, sound_index, detected_at)?;
-        match outcome {
-            DetectionOutcome::Completed { lag } => tracing::info!(
-                room_id = %room_id,
-                participant_id = %participant_id,
-                lag_us = lag,
-                "participant lag determined"
-            ),
-            DetectionOutcome::Recorded => tracing::debug!(
-                room_id = %room_id,
-                participant_id = %participant_id,
-                detected_at,
-                "calibration sound detection recorded"
-            ),
-            DetectionOutcome::AlreadyCompleted => {}
-        }
-        Ok(outcome)
-    }
-
     /// Records one participant device-shake report (sent unreliably as a
-    /// datagram). Reports are only considered in sync-rate calculations for
-    /// participants in the room whose lag has been determined.
+    /// datagram).
     pub fn record_shake(
         &self,
         room_id: &str,
