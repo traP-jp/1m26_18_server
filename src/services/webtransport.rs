@@ -1,9 +1,11 @@
 use std::{
     io,
     net::SocketAddr,
-    sync::LazyLock,
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    sync::{Arc, LazyLock},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
+
+use parking_lot::Mutex;
 
 use axum::extract::Query;
 use serde::Deserialize;
@@ -26,6 +28,17 @@ use crate::{
     repository::room::{InsertHostError, InsertParticipantError},
     services::room::RoomService,
 };
+
+/// Time without any client bidirectional-stream message after which the
+/// server closes the connection as dead.
+///
+/// Clients should send [`ClientMessage::Heartbeat`] (or any other client
+/// message) about every 5 seconds. Transport-level QUIC keep-alives are not
+/// sufficient: browsers may keep ACKing them after the tab was closed.
+pub(crate) const HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Polling interval of the heartbeat watchdog.
+const WATCHDOG_TICK: Duration = Duration::from_secs(1);
 
 static ROOM_ROUTER: LazyLock<matchit::Router<()>> = LazyLock::new(|| {
     let mut router = matchit::Router::new();
@@ -51,6 +64,7 @@ pub fn certificate_hash_hex(digest: &Sha256Digest) -> String {
 pub struct WebTransportServer {
     endpoint: Endpoint<Server>,
     room_service: RoomService,
+    heartbeat_timeout: Duration,
 }
 
 impl WebTransportServer {
@@ -58,6 +72,16 @@ impl WebTransportServer {
     pub fn new(
         room_service: RoomService,
         port: u16,
+    ) -> Result<(Self, Sha256Digest), WebTransportError> {
+        Self::with_heartbeat_timeout(room_service, port, HEARTBEAT_TIMEOUT)
+    }
+
+    /// Same as [`WebTransportServer::new`] with an injectable heartbeat
+    /// timeout (tests use a short timeout instead of [`HEARTBEAT_TIMEOUT`]).
+    pub fn with_heartbeat_timeout(
+        room_service: RoomService,
+        port: u16,
+        heartbeat_timeout: Duration,
     ) -> Result<(Self, Sha256Digest), WebTransportError> {
         let identity = Identity::self_signed(["localhost", "127.0.0.1"])?;
 
@@ -81,6 +105,7 @@ impl WebTransportServer {
             Self {
                 endpoint,
                 room_service,
+                heartbeat_timeout,
             },
             hash,
         ))
@@ -96,16 +121,21 @@ impl WebTransportServer {
         loop {
             let incoming_session = self.endpoint.accept().await;
             let room_service = self.room_service.clone();
+            let heartbeat_timeout = self.heartbeat_timeout;
             let span_id = id;
             id = id.wrapping_add(1);
             tokio::spawn(
-                Self::handle_incoming_session(incoming_session, room_service)
+                Self::handle_incoming_session(incoming_session, room_service, heartbeat_timeout)
                     .instrument(tracing::info_span!("wt_session", span_id)),
             );
         }
     }
 
-    async fn handle_incoming_session(incoming_session: IncomingSession, room_service: RoomService) {
+    async fn handle_incoming_session(
+        incoming_session: IncomingSession,
+        room_service: RoomService,
+        heartbeat_timeout: Duration,
+    ) {
         let session_request = match incoming_session.await {
             Ok(req) => req,
             Err(e) => {
@@ -167,7 +197,15 @@ impl WebTransportServer {
 
             info!(room_id = %room_id, host_id = %host_id, "host joined room");
 
-            run_connection_handlers(&room_service, &room_id, host_id, true, &connection).await;
+            run_connection_handlers_with_timeout(
+                &room_service,
+                &room_id,
+                host_id,
+                true,
+                &connection,
+                heartbeat_timeout,
+            )
+            .await;
 
             info!(room_id = %room_id, host_id = %host_id, "host disconnected, removing room");
             room_service.remove_room(&room_id);
@@ -205,7 +243,15 @@ impl WebTransportServer {
             ServerMessage::ParticipantJoined { participant_id },
         ));
 
-        run_connection_handlers(&room_service, &room_id, participant_id, false, &connection).await;
+        run_connection_handlers_with_timeout(
+            &room_service,
+            &room_id,
+            participant_id,
+            false,
+            &connection,
+            heartbeat_timeout,
+        )
+        .await;
 
         room_service.leave_room(&room_id, &participant_id);
 
@@ -294,12 +340,17 @@ async fn notify_participants(room_service: RoomService, room_id: String, message
 
 /// Accepts bidirectional streams until the connection closes, handling each
 /// request in its own task. Shared by participants and the host.
+///
+/// Every successfully decoded client message refreshes `last_seen`, so a
+/// client sending any message (including [`ClientMessage::Heartbeat`]) about
+/// every 5 seconds stays alive.
 async fn handle_connection_streams(
     room_service: &RoomService,
     room_id: &str,
     client_id: Uuid,
     is_host: bool,
     connection: &wtransport::Connection,
+    last_seen: Arc<Mutex<Instant>>,
 ) {
     loop {
         let (send_stream, recv_stream) = match connection.accept_bi().await {
@@ -313,6 +364,7 @@ async fn handle_connection_streams(
         // The spawned task needs 'static data, so pass owned clones.
         let room_service = room_service.clone();
         let room_id = room_id.to_string();
+        let last_seen = Arc::clone(&last_seen);
         tokio::spawn(async move {
             if let Err(e) = handle_bi_stream(
                 &room_service,
@@ -321,6 +373,7 @@ async fn handle_connection_streams(
                 is_host,
                 send_stream,
                 recv_stream,
+                &last_seen,
             )
             .await
             {
@@ -331,25 +384,86 @@ async fn handle_connection_streams(
 }
 
 /// Serves a connection until it closes: bidirectional streams are handled
-/// inline, datagrams in a dedicated task. Shared by participants and the host.
-async fn run_connection_handlers(
+/// inline, datagrams and the heartbeat watchdog run in dedicated tasks.
+/// Shared by participants and the host.
+///
+/// `heartbeat_timeout` is [`HEARTBEAT_TIMEOUT`] in production; tests inject a
+/// short timeout.
+async fn run_connection_handlers_with_timeout(
     room_service: &RoomService,
     room_id: &str,
     client_id: Uuid,
     is_host: bool,
     connection: &wtransport::Connection,
+    heartbeat_timeout: Duration,
 ) {
+    // Per-connection liveness timestamp, refreshed on every decoded client
+    // message. The watchdog closes connections silent for `heartbeat_timeout`,
+    // which drives the existing cleanup (`leave_room` / `remove_room`).
+    let last_seen: Arc<Mutex<Instant>> = Arc::new(Mutex::new(Instant::now()));
+
     // Unreliable events travel as datagrams; they are served concurrently
     // with the streams. The task ends on its own when the connection closes.
-    tokio::spawn(handle_datagrams(
+    let datagram_handle = tokio::spawn(handle_datagrams(
         room_service.clone(),
         room_id.to_string(),
         client_id,
         is_host,
         connection.clone(),
+        Arc::clone(&last_seen),
     ));
 
-    handle_connection_streams(room_service, room_id, client_id, is_host, connection).await;
+    let watchdog_handle = tokio::spawn(run_heartbeat_watchdog(
+        room_id.to_string(),
+        client_id,
+        connection.clone(),
+        Arc::clone(&last_seen),
+        heartbeat_timeout,
+    ));
+
+    handle_connection_streams(
+        room_service,
+        room_id,
+        client_id,
+        is_host,
+        connection,
+        last_seen,
+    )
+    .await;
+
+    // The connection is closed (cleanly or by the watchdog): stop the
+    // background tasks. The datagram task usually already ended on its own.
+    watchdog_handle.abort();
+    datagram_handle.abort();
+}
+
+/// Closes connections that stopped sending application messages.
+///
+/// QUIC keep-alives are ACKed by the transport even after the browser tab was
+/// closed, so only application traffic proves the client is alive. On timeout
+/// the connection is closed, which unblocks `accept_bi` / `receive_datagram`
+/// and runs the normal disconnect cleanup.
+async fn run_heartbeat_watchdog(
+    room_id: String,
+    client_id: Uuid,
+    connection: wtransport::Connection,
+    last_seen: Arc<Mutex<Instant>>,
+    timeout: Duration,
+) {
+    loop {
+        sleep(WATCHDOG_TICK).await;
+        let elapsed = last_seen.lock().elapsed();
+        if elapsed >= timeout {
+            warn!(
+                room_id = %room_id,
+                client_id = %client_id,
+                elapsed_secs = elapsed.as_secs(),
+                "heartbeat timeout, closing connection"
+            );
+            connection.close(wtransport::VarInt::from_u32(408), b"heartbeat timeout");
+            break;
+        }
+    }
 }
 
 /// Receives datagrams until the connection closes. Only `Shake` reports are
@@ -361,6 +475,7 @@ async fn handle_datagrams(
     client_id: Uuid,
     is_host: bool,
     connection: wtransport::Connection,
+    last_seen: Arc<Mutex<Instant>>,
 ) {
     loop {
         let datagram = match connection.receive_datagram().await {
@@ -378,6 +493,7 @@ async fn handle_datagrams(
 
         match decode_exact::<ClientMessage>(&datagram.payload()) {
             Ok(ClientMessage::Shake { detected_at }) => {
+                *last_seen.lock() = Instant::now();
                 handle_shake(&room_service, &room_id, client_id, is_host, detected_at);
             }
             Ok(message) => {
@@ -431,6 +547,7 @@ async fn handle_bi_stream(
     is_host: bool,
     mut send_stream: wtransport::SendStream,
     mut recv_stream: wtransport::RecvStream,
+    last_seen: &Mutex<Instant>,
 ) -> Result<(), WebTransportError> {
     // Read the client request (capped at 8 KiB; excess is truncated).
     let mut buf = Vec::new();
@@ -442,6 +559,7 @@ async fn handle_bi_stream(
 
     if buf.is_empty() {
         // Treat an empty request as a join (browser implementations differ).
+        *last_seen.lock() = Instant::now();
         let response = ServerMessage::Joined {
             participant_id: client_id,
         };
@@ -449,54 +567,68 @@ async fn handle_bi_stream(
         return Ok(());
     }
 
-    let response = match decode_exact::<ClientMessage>(&buf) {
-        Ok(ClientMessage::Join) => Some(ServerMessage::Joined {
-            participant_id: client_id,
-        }),
-        Ok(ClientMessage::TimeSyncRequest) => {
-            // Stateless NTP-like exchange: t1 is taken as soon as the request
-            // has been received and t2 right before the response is written.
-            let t1 = unix_micros();
-            let t2 = unix_micros();
-            Some(ServerMessage::TimeSyncResponse { t1, t2 })
-        }
-        Ok(ClientMessage::Ready) => {
-            // Fire-and-forget: the server records the participant's readiness
-            // and never responds; the host is notified on the first report.
-            handle_ready(room_service, room_id, client_id, is_host);
-            None
-        }
-        Ok(ClientMessage::Stamp { stamp_id }) => {
-            // Fire-and-forget: the server relays the stamp to the host and
-            // never responds.
-            handle_stamp(room_service, room_id, client_id, is_host, stamp_id);
-            None
-        }
-        Ok(ClientMessage::ColorChange { color_id }) => {
-            // Fire-and-forget: the server relays the color change to the host
-            // and never responds.
-            handle_color_change(room_service, room_id, client_id, is_host, color_id);
-            None
-        }
-        Ok(ClientMessage::LiveStart { start_time }) => {
-            // Fire-and-forget: the server transitions the room to live and
-            // broadcasts the start time to every participant; it never
-            // responds.
-            handle_live_start(room_service, room_id, client_id, is_host, start_time);
-            None
-        }
-        Ok(ClientMessage::Shake { detected_at }) => {
-            // Shakes are expected on the unreliable datagram channel; for
-            // robustness a shake reported on a stream is recorded the same
-            // way. Fire-and-forget: no response is written.
-            handle_shake(room_service, room_id, client_id, is_host, detected_at);
-            None
+    let message = match decode_exact::<ClientMessage>(&buf) {
+        Ok(message) => {
+            // Any decodable client message proves the application is alive.
+            // Unknown IDs and malformed messages must not refresh liveness.
+            *last_seen.lock() = Instant::now();
+            message
         }
         Err(e) => {
             // Unknown event IDs and malformed messages are ignored silently
             // (no response is written) so that new client events can be
             // rolled out independently.
             warn!(participant_id = %client_id, error = %e, "ignoring undecodable client message");
+            return send_stream.finish().await.map_err(WebTransportError::from);
+        }
+    };
+
+    let response = match message {
+        ClientMessage::Join => Some(ServerMessage::Joined {
+            participant_id: client_id,
+        }),
+        ClientMessage::TimeSyncRequest => {
+            // Stateless NTP-like exchange: t1 is taken as soon as the request
+            // has been received and t2 right before the response is written.
+            let t1 = unix_micros();
+            let t2 = unix_micros();
+            Some(ServerMessage::TimeSyncResponse { t1, t2 })
+        }
+        ClientMessage::Heartbeat => {
+            // Fire-and-forget liveness heartbeat; no response is written.
+            debug!(participant_id = %client_id, "heartbeat received");
+            None
+        }
+        ClientMessage::Ready => {
+            // Fire-and-forget: the server records the participant's readiness
+            // and never responds; the host is notified on the first report.
+            handle_ready(room_service, room_id, client_id, is_host);
+            None
+        }
+        ClientMessage::Stamp { stamp_id } => {
+            // Fire-and-forget: the server relays the stamp to the host and
+            // never responds.
+            handle_stamp(room_service, room_id, client_id, is_host, stamp_id);
+            None
+        }
+        ClientMessage::ColorChange { color_id } => {
+            // Fire-and-forget: the server relays the color change to the host
+            // and never responds.
+            handle_color_change(room_service, room_id, client_id, is_host, color_id);
+            None
+        }
+        ClientMessage::LiveStart { start_time } => {
+            // Fire-and-forget: the server transitions the room to live and
+            // broadcasts the start time to every participant; it never
+            // responds.
+            handle_live_start(room_service, room_id, client_id, is_host, start_time);
+            None
+        }
+        ClientMessage::Shake { detected_at } => {
+            // Shakes are expected on the unreliable datagram channel; for
+            // robustness a shake reported on a stream is recorded the same
+            // way. Fire-and-forget: no response is written.
+            handle_shake(room_service, room_id, client_id, is_host, detected_at);
             None
         }
     };
@@ -858,8 +990,16 @@ mod tests {
     }
 
     async fn start_server(room_service: RoomService) -> (u16, Sha256Digest) {
+        start_server_with_timeout(room_service, HEARTBEAT_TIMEOUT).await
+    }
+
+    async fn start_server_with_timeout(
+        room_service: RoomService,
+        heartbeat_timeout: Duration,
+    ) -> (u16, Sha256Digest) {
         let (server, cert_hash) =
-            WebTransportServer::new(room_service, 0).expect("server creation");
+            WebTransportServer::with_heartbeat_timeout(room_service, 0, heartbeat_timeout)
+                .expect("server creation");
         let server_port = server.local_addr().expect("local addr").port();
         tokio::spawn(async move {
             let _ = server.serve().await;
@@ -2052,6 +2192,166 @@ mod tests {
 
         host.close(wtransport::VarInt::from_u32(0), b"done");
         participant.close(wtransport::VarInt::from_u32(0), b"done");
+    }
+
+    /// Sends heartbeats until the task is aborted (keeps a test connection alive).
+    async fn heartbeat_loop(connection: wtransport::Connection) {
+        loop {
+            send_client_message(&connection, &ClientMessage::Heartbeat).await;
+            sleep(Duration::from_millis(200)).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn test_webtransport_heartbeat_gets_no_response() {
+        let room_id = "3131";
+        let (_room_repo, room_service) = setup_room_service(room_id);
+
+        let (server_port, cert_hash) = start_server(room_service).await;
+        let client = test_client(cert_hash);
+
+        let host = client
+            .connect(format!(
+                "https://127.0.0.1:{server_port}/rooms/{room_id}?hostToken={HOST_TOKEN}"
+            ))
+            .await
+            .expect("connect as host");
+        sleep(Duration::from_millis(200)).await;
+
+        let participant = client
+            .connect(format!("https://127.0.0.1:{server_port}/rooms/{room_id}"))
+            .await
+            .expect("connect as participant");
+        join_as_participant(&participant).await;
+
+        let response = send_client_message(&participant, &ClientMessage::Heartbeat).await;
+        assert!(response.is_empty(), "heartbeat must not get a response");
+
+        host.close(wtransport::VarInt::from_u32(0), b"done");
+        participant.close(wtransport::VarInt::from_u32(0), b"done");
+    }
+
+    #[tokio::test]
+    async fn test_webtransport_idle_participant_reaped() {
+        let room_id = "3232";
+        let (room_repo, room_service) = setup_room_service(room_id);
+
+        let (server_port, cert_hash) =
+            start_server_with_timeout(room_service, Duration::from_millis(600)).await;
+        let client = test_client(cert_hash);
+
+        let host = client
+            .connect(format!(
+                "https://127.0.0.1:{server_port}/rooms/{room_id}?hostToken={HOST_TOKEN}"
+            ))
+            .await
+            .expect("connect as host");
+        sleep(Duration::from_millis(200)).await;
+        // The host stays alive with heartbeats while the participant idles.
+        let host_heartbeats = tokio::spawn(heartbeat_loop(host.clone()));
+
+        let participant = client
+            .connect(format!("https://127.0.0.1:{server_port}/rooms/{room_id}"))
+            .await
+            .expect("connect as participant");
+        join_as_participant(&participant).await;
+        sleep(Duration::from_millis(100)).await;
+        assert_eq!(room_repo.participant_count(room_id), Some(1));
+
+        // Drain the join notification so the leave notification can be read next.
+        assert!(matches!(
+            recv_server_message(&host).await,
+            ServerMessage::ParticipantJoined { .. }
+        ));
+
+        // No heartbeats from the participant: the watchdog must close it.
+        sleep(Duration::from_millis(2500)).await;
+        assert_eq!(
+            room_repo.participant_count(room_id),
+            Some(0),
+            "idle participant must be reaped"
+        );
+        assert!(
+            room_repo.exists(room_id),
+            "room must survive a participant timeout"
+        );
+        assert!(matches!(
+            timeout(Duration::from_secs(2), recv_server_message(&host))
+                .await
+                .expect("leave notification"),
+            ServerMessage::ParticipantLeft { .. }
+        ));
+
+        host_heartbeats.abort();
+        host.close(wtransport::VarInt::from_u32(0), b"done");
+        participant.close(wtransport::VarInt::from_u32(0), b"done");
+    }
+
+    #[tokio::test]
+    async fn test_webtransport_heartbeat_keeps_participant_alive() {
+        let room_id = "3333";
+        let (room_repo, room_service) = setup_room_service(room_id);
+
+        let (server_port, cert_hash) =
+            start_server_with_timeout(room_service, Duration::from_millis(600)).await;
+        let client = test_client(cert_hash);
+
+        let host = client
+            .connect(format!(
+                "https://127.0.0.1:{server_port}/rooms/{room_id}?hostToken={HOST_TOKEN}"
+            ))
+            .await
+            .expect("connect as host");
+        sleep(Duration::from_millis(200)).await;
+        let host_heartbeats = tokio::spawn(heartbeat_loop(host.clone()));
+
+        let participant = client
+            .connect(format!("https://127.0.0.1:{server_port}/rooms/{room_id}"))
+            .await
+            .expect("connect as participant");
+        join_as_participant(&participant).await;
+        let participant_heartbeats = tokio::spawn(heartbeat_loop(participant.clone()));
+
+        sleep(Duration::from_millis(2500)).await;
+        assert_eq!(
+            room_repo.participant_count(room_id),
+            Some(1),
+            "heartbeat sender must not be reaped"
+        );
+
+        host_heartbeats.abort();
+        participant_heartbeats.abort();
+        host.close(wtransport::VarInt::from_u32(0), b"done");
+        participant.close(wtransport::VarInt::from_u32(0), b"done");
+    }
+
+    #[tokio::test]
+    async fn test_webtransport_idle_host_reaped() {
+        let room_id = "3434";
+        let (room_repo, room_service) = setup_room_service(room_id);
+
+        let (server_port, cert_hash) =
+            start_server_with_timeout(room_service, Duration::from_millis(600)).await;
+        let client = test_client(cert_hash);
+
+        let host = client
+            .connect(format!(
+                "https://127.0.0.1:{server_port}/rooms/{room_id}?hostToken={HOST_TOKEN}"
+            ))
+            .await
+            .expect("connect as host");
+        sleep(Duration::from_millis(200)).await;
+        assert!(room_repo.host_id(room_id).is_some());
+
+        // No heartbeats from the host: the watchdog must close it and the
+        // room must be removed like on a clean host disconnect.
+        sleep(Duration::from_millis(2500)).await;
+        assert!(
+            !room_repo.exists(room_id),
+            "room must be removed after host heartbeat timeout"
+        );
+
+        host.close(wtransport::VarInt::from_u32(0), b"done");
     }
 
     #[tokio::test]

@@ -321,6 +321,10 @@ pub struct GetRoomResponse {
 pub enum ClientMessage {
     Join,
     TimeSyncRequest,
+    /// Liveness heartbeat. Clients should send this on a new bidirectional
+    /// stream about every 5 seconds for the whole session; the server closes
+    /// connections silent for 10 seconds. Fire-and-forget: no response.
+    Heartbeat,
     /// Participant: reports itself as ready to start. Idempotent; a repeated
     /// report does not change the state.
     Ready,

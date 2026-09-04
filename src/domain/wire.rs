@@ -28,6 +28,7 @@
 //! |------|-----------|--------------------|------------------------------------|
 //! | 0x01 | C -> S    | Join               | empty                              |
 //! | 0x02 | C -> S    | TimeSyncRequest    | empty                              |
+//! | 0x03 | C -> S    | Heartbeat          | empty                              |
 //! | 0x05 | C -> S    | Ready              | empty                              |
 //! | 0x06 | C -> S    | Stamp              | u8 stamp id                        |
 //! | 0x07 | C -> S    | LiveStart          | u64 (unix µs, live start time)     |
@@ -45,13 +46,20 @@
 //! | 0x8A | S -> C    | ParticipantLeft  | 16-byte UUID (participant id)      |
 //!
 //! `Joined` and `TimeSyncResponse` are responses written on the
-//! client-initiated stream that carried the request; `ParticipantJoined`,
+//! client-initiated stream that carried the request; `Heartbeat`, `Ready`,
+//! `Stamp`, `ColorChange`, `LiveStart` and `Shake` sent on streams are
+//! fire-and-forget (the server only finishes the stream). `ParticipantJoined`,
 //! `ParticipantLeft`, `ParticipantReady`, `ParticipantStamp`, `LiveStarted`
 //! and `ParticipantColorChange` are pushed by the server on a server-initiated
 //! bidirectional stream (clients must accept incoming streams). `Shake` is
 //! sent by clients as an unreliable WebTransport datagram and `SyncRate` is
 //! pushed by the server as a datagram; each datagram carries exactly one
 //! message.
+//!
+//! Liveness: clients should send `Heartbeat` (or any other client message)
+//! on a new bidirectional stream about every 5 seconds; the server closes
+//! connections silent for 10 seconds. This detects clients whose QUIC
+//! connection still ACKs keep-alives after the tab was closed.
 
 use std::str::from_utf8;
 
@@ -63,6 +71,8 @@ use crate::domain::room::{ClientMessage, ServerMessage};
 pub const EVENT_JOIN: u8 = 0x01;
 /// Event ID of [`ClientMessage::TimeSyncRequest`].
 pub const EVENT_TIME_SYNC_REQUEST: u8 = 0x02;
+/// Event ID of [`ClientMessage::Heartbeat`].
+pub const EVENT_HEARTBEAT: u8 = 0x03;
 /// Event ID of [`ClientMessage::Ready`].
 pub const EVENT_READY: u8 = 0x05;
 /// Event ID of [`ClientMessage::Stamp`].
@@ -232,6 +242,7 @@ impl Encode for ClientMessage {
         match self {
             ClientMessage::Join => EVENT_JOIN.encode(buf),
             ClientMessage::TimeSyncRequest => EVENT_TIME_SYNC_REQUEST.encode(buf),
+            ClientMessage::Heartbeat => EVENT_HEARTBEAT.encode(buf),
             ClientMessage::Ready => EVENT_READY.encode(buf),
             ClientMessage::Stamp { stamp_id } => {
                 EVENT_STAMP.encode(buf)?;
@@ -258,6 +269,7 @@ impl Decode for ClientMessage {
         match u8::decode(buf)? {
             EVENT_JOIN => Ok(ClientMessage::Join),
             EVENT_TIME_SYNC_REQUEST => Ok(ClientMessage::TimeSyncRequest),
+            EVENT_HEARTBEAT => Ok(ClientMessage::Heartbeat),
             EVENT_READY => Ok(ClientMessage::Ready),
             EVENT_STAMP => Ok(ClientMessage::Stamp {
                 stamp_id: u8::decode(buf)?,
@@ -623,6 +635,19 @@ mod tests {
     }
 
     #[test]
+    fn heartbeat_roundtrip() {
+        let mut buf = Vec::new();
+        ClientMessage::Heartbeat
+            .encode(&mut buf)
+            .expect("encode heartbeat");
+        assert_eq!(buf, [EVENT_HEARTBEAT]);
+        assert!(matches!(
+            decode_exact::<ClientMessage>(&buf).expect("decode heartbeat"),
+            ClientMessage::Heartbeat
+        ));
+    }
+
+    #[test]
     fn time_sync_response_roundtrip() {
         let mut buf = Vec::new();
         ServerMessage::TimeSyncResponse { t1: 1000, t2: 2000 }
@@ -752,6 +777,11 @@ mod tests {
     #[test]
     fn trailing_bytes() {
         let mut buf = vec![EVENT_JOIN, 0x00];
+        assert!(matches!(
+            decode_exact::<ClientMessage>(&buf),
+            Err(DecodeError::TrailingBytes)
+        ));
+        buf = vec![EVENT_HEARTBEAT, 0x00];
         assert!(matches!(
             decode_exact::<ClientMessage>(&buf),
             Err(DecodeError::TrailingBytes)
