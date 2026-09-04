@@ -208,6 +208,14 @@ impl WebTransportServer {
         run_connection_handlers(&room_service, &room_id, participant_id, false, &connection).await;
 
         room_service.leave_room(&room_id, &participant_id);
+
+        // Fire-and-forget: the leave flow must not block on (or fail with)
+        // the host notification.
+        tokio::spawn(notify_host(
+            room_service.clone(),
+            room_id.clone(),
+            ServerMessage::ParticipantLeft { participant_id },
+        ));
     }
 }
 
@@ -892,6 +900,9 @@ mod tests {
             ServerMessage::Error { message } => panic!("unexpected error: {message}"),
             ServerMessage::ParticipantJoined { .. } => {
                 panic!("unexpected participant joined notification")
+            }
+            ServerMessage::ParticipantLeft { .. } => {
+                panic!("unexpected participant left notification")
             }
             ServerMessage::ParticipantReady { .. } => {
                 panic!("unexpected participant ready notification")
@@ -1630,6 +1641,56 @@ mod tests {
 
         host.close(wtransport::VarInt::from_u32(0), b"done");
         participant.close(wtransport::VarInt::from_u32(0), b"done");
+    }
+
+    #[tokio::test]
+    async fn test_webtransport_notify_host_on_participant_leave() {
+        let room_id = "9091";
+        let (room_repo, room_service) = setup_room_service(room_id);
+
+        let (server_port, cert_hash) = start_server(room_service).await;
+        let client = test_client(cert_hash);
+
+        let host = client
+            .connect(format!(
+                "https://127.0.0.1:{server_port}/rooms/{room_id}?hostToken={HOST_TOKEN}"
+            ))
+            .await
+            .expect("connect as host");
+        sleep(Duration::from_millis(200)).await;
+
+        let participant = client
+            .connect(format!("https://127.0.0.1:{server_port}/rooms/{room_id}"))
+            .await
+            .expect("connect as participant");
+        let participant_id = join_as_participant(&participant).await;
+
+        // Drain the participant-joined notification first.
+        assert!(matches!(
+            timeout(Duration::from_secs(5), recv_server_message(&host))
+                .await
+                .expect("participant-joined notification"),
+            ServerMessage::ParticipantJoined { .. }
+        ));
+        assert_eq!(room_repo.participant_count(room_id), Some(1));
+
+        // Closing the participant's connection notifies the host.
+        participant.close(wtransport::VarInt::from_u32(0), b"done");
+        match timeout(Duration::from_secs(5), recv_server_message(&host))
+            .await
+            .expect("participant-left notification")
+        {
+            ServerMessage::ParticipantLeft {
+                participant_id: notified,
+            } => {
+                assert_eq!(notified, participant_id);
+            }
+            other => panic!("unexpected message: {other:?}"),
+        }
+        sleep(Duration::from_millis(200)).await;
+        assert_eq!(room_repo.participant_count(room_id), Some(0));
+
+        host.close(wtransport::VarInt::from_u32(0), b"done");
     }
 
     #[tokio::test]

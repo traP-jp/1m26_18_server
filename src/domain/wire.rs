@@ -42,11 +42,12 @@
 //! | 0x87 | S -> C    | LiveStarted        | u64 (unix µs, live start time)     |
 //! | 0x88 | S -> C    | ParticipantColorChange | 16-byte UUID (participant id) + u8 color id |
 //! | 0x89 | S -> C    | SyncRate           | u8 (sync rate 0-100)               |
+//! | 0x8A | S -> C    | ParticipantLeft  | 16-byte UUID (participant id)      |
 //!
 //! `Joined` and `TimeSyncResponse` are responses written on the
 //! client-initiated stream that carried the request; `ParticipantJoined`,
-//! `ParticipantReady`, `ParticipantStamp`, `LiveStarted` and
-//! `ParticipantColorChange` are pushed by the server on a server-initiated
+//! `ParticipantLeft`, `ParticipantReady`, `ParticipantStamp`, `LiveStarted`
+//! and `ParticipantColorChange` are pushed by the server on a server-initiated
 //! bidirectional stream (clients must accept incoming streams). `Shake` is
 //! sent by clients as an unreliable WebTransport datagram and `SyncRate` is
 //! pushed by the server as a datagram; each datagram carries exactly one
@@ -90,6 +91,8 @@ pub const EVENT_LIVE_STARTED: u8 = 0x87;
 pub const EVENT_PARTICIPANT_COLOR_CHANGE: u8 = 0x88;
 /// Event ID of [`ServerMessage::SyncRate`].
 pub const EVENT_SYNC_RATE: u8 = 0x89;
+/// Event ID of [`ServerMessage::ParticipantLeft`].
+pub const EVENT_PARTICIPANT_LEFT: u8 = 0x8A;
 
 #[derive(Debug, thiserror::Error)]
 pub enum EncodeError {
@@ -293,6 +296,10 @@ impl Encode for ServerMessage {
                 EVENT_PARTICIPANT_JOINED.encode(buf)?;
                 participant_id.encode(buf)
             }
+            ServerMessage::ParticipantLeft { participant_id } => {
+                EVENT_PARTICIPANT_LEFT.encode(buf)?;
+                participant_id.encode(buf)
+            }
             ServerMessage::ParticipantReady { participant_id } => {
                 EVENT_PARTICIPANT_READY.encode(buf)?;
                 participant_id.encode(buf)
@@ -339,6 +346,9 @@ impl Decode for ServerMessage {
                 message: String::decode(buf)?,
             }),
             EVENT_PARTICIPANT_JOINED => Ok(ServerMessage::ParticipantJoined {
+                participant_id: Uuid::decode(buf)?,
+            }),
+            EVENT_PARTICIPANT_LEFT => Ok(ServerMessage::ParticipantLeft {
                 participant_id: Uuid::decode(buf)?,
             }),
             EVENT_PARTICIPANT_READY => Ok(ServerMessage::ParticipantReady {
@@ -404,6 +414,21 @@ mod tests {
         assert_eq!(buf.len(), 17);
         match decode_exact::<ServerMessage>(&buf).expect("decode participant joined") {
             ServerMessage::ParticipantJoined { participant_id } => assert_eq!(participant_id, id),
+            other => panic!("unexpected message: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn participant_left_roundtrip() {
+        let id = Uuid::now_v7();
+        let mut buf = Vec::new();
+        ServerMessage::ParticipantLeft { participant_id: id }
+            .encode(&mut buf)
+            .expect("encode participant left");
+        assert_eq!(buf[0], EVENT_PARTICIPANT_LEFT);
+        assert_eq!(buf.len(), 17);
+        match decode_exact::<ServerMessage>(&buf).expect("decode participant left") {
+            ServerMessage::ParticipantLeft { participant_id } => assert_eq!(participant_id, id),
             other => panic!("unexpected message: {other:?}"),
         }
     }
@@ -701,6 +726,16 @@ mod tests {
             decode_exact::<ServerMessage>(&[EVENT_SYNC_RATE]),
             Err(DecodeError::UnexpectedEof)
         ));
+        assert!(matches!(
+            decode_exact::<ServerMessage>(&[EVENT_PARTICIPANT_LEFT]),
+            Err(DecodeError::UnexpectedEof)
+        ));
+        let mut buf = vec![EVENT_PARTICIPANT_LEFT];
+        buf.extend_from_slice(&[0u8; 15]);
+        assert!(matches!(
+            decode_exact::<ServerMessage>(&buf),
+            Err(DecodeError::UnexpectedEof)
+        ));
     }
 
     #[test]
@@ -738,6 +773,19 @@ mod tests {
         assert!(matches!(
             decode_exact::<ServerMessage>(&buf),
             Err(DecodeError::UnexpectedEof)
+        ));
+        buf = vec![EVENT_PARTICIPANT_LEFT];
+        buf.extend_from_slice(&[0u8; 15]);
+        assert!(matches!(
+            decode_exact::<ServerMessage>(&buf),
+            Err(DecodeError::UnexpectedEof)
+        ));
+        buf = vec![EVENT_PARTICIPANT_LEFT];
+        buf.extend_from_slice(&[0u8; 16]);
+        buf.push(0x00);
+        assert!(matches!(
+            decode_exact::<ServerMessage>(&buf),
+            Err(DecodeError::TrailingBytes)
         ));
         buf = vec![EVENT_STAMP];
         buf.extend_from_slice(&[0u8; 2]);

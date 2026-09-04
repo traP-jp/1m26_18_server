@@ -371,6 +371,11 @@ pub enum ServerMessage {
     ParticipantJoined {
         participant_id: Uuid,
     },
+    /// Host only: a participant disconnected (its WebTransport connection
+    /// closed). Sent on a server-initiated bidirectional stream.
+    ParticipantLeft {
+        participant_id: Uuid,
+    },
     /// Host only: a participant reported itself as ready to start. Sent on a
     /// server-initiated bidirectional stream, once per participant (a repeated
     /// report does not retrigger the notification).
