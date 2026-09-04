@@ -48,7 +48,7 @@ pub fn setup_openapi_routes() -> (Router<AppState>, OpenApi) {
             song::get_song_by_url,
             song::create_song
         ))
-        .routes(utoipa_axum::routes!(room::create_room))
+        .routes(utoipa_axum::routes!(room::create_room, room::get_room))
         .routes(utoipa_axum::routes!(webtransport::get_certificate_hash))
         .split_for_parts()
 }

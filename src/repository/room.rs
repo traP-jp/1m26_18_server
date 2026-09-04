@@ -3,6 +3,7 @@ use std::{collections::HashMap, sync::Arc};
 use parking_lot::RwLock;
 use uuid::Uuid;
 
+use crate::domain::model::CompleteSongData;
 use crate::domain::room::{Host, Participant, Room, ShakeOutcome};
 
 #[derive(Clone, Default)]
@@ -23,6 +24,14 @@ impl RoomRepository {
 
     pub fn insert(&self, room_id: String, room: Room) {
         self.inner.write().insert(room_id, room);
+    }
+
+    /// Returns a clone of the room's song data. `None` if the room does not exist.
+    pub fn get_song(&self, room_id: &str) -> Option<CompleteSongData> {
+        self.inner
+            .read()
+            .get(room_id)
+            .map(|room| room.song().clone())
     }
 
     /// Returns whether the room's host has joined. Participants may join a

@@ -8,7 +8,7 @@ pub enum SongData {
     Incomplete(IncompleteSongData),
 }
 
-#[derive(Deserialize, Serialize, ToSchema)]
+#[derive(Clone, Deserialize, Serialize, ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct CompleteSongData {
     artist: String,
@@ -72,7 +72,7 @@ impl IncompleteSongData {
     }
 }
 
-#[derive(Deserialize, Serialize, ToSchema)]
+#[derive(Clone, Deserialize, Serialize, ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct Beat {
     starts_at_ms: f32,
@@ -104,7 +104,7 @@ impl Phrase {
     }
 }
 
-#[derive(Deserialize, Serialize, ToSchema)]
+#[derive(Clone, Deserialize, Serialize, ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct Segment {
     is_chorus: bool,

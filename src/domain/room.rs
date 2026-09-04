@@ -23,6 +23,15 @@ pub enum Room {
 }
 
 impl Room {
+    /// Returns the room's song, regardless of the room state.
+    pub fn song(&self) -> &CompleteSongData {
+        match self {
+            Room::Waiting(waiting) => waiting.song(),
+            Room::HostJoined(joined) => joined.song(),
+            Room::Live(live) => live.song(),
+        }
+    }
+
     /// Returns the room's participants; `None` while the room is waiting for
     /// its host, as participants may join only after the host has joined.
     pub fn participants(&self) -> Option<&HashMap<Uuid, Participant>> {
@@ -297,6 +306,12 @@ pub struct CreateRoomRequest {
 pub struct CreateRoomResponse {
     pub room_id: String,
     pub host_token: Uuid,
+}
+
+#[derive(Deserialize, Serialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct GetRoomResponse {
+    pub song: CompleteSongData,
 }
 
 /// Message sent from the client to the server over WebTransport.

@@ -1,7 +1,7 @@
 use rand::RngExt;
 use uuid::Uuid;
 
-use crate::domain::model::SongData;
+use crate::domain::model::{CompleteSongData, SongData};
 use crate::domain::room::{Room, WaitingRoom};
 use crate::repository::room::{
     InsertHostError, InsertParticipantError, RoomRepository, SetReadyError, ShakeError,
@@ -143,6 +143,11 @@ impl RoomService {
 
     pub fn exists(&self, room_id: &str) -> bool {
         self.repo.exists(room_id)
+    }
+
+    /// Returns a clone of the room's song data. `None` if the room does not exist.
+    pub fn get_room_song(&self, room_id: &str) -> Option<CompleteSongData> {
+        self.repo.get_song(room_id)
     }
 
     /// Records one participant device-shake report (sent unreliably as a

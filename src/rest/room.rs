@@ -1,7 +1,12 @@
-use axum::{Json, extract::State, http::StatusCode, response::IntoResponse};
+use axum::{
+    Json,
+    extract::{Path, State},
+    http::StatusCode,
+    response::IntoResponse,
+};
 use serde_json::json;
 
-use crate::domain::room::{CreateRoomRequest, CreateRoomResponse};
+use crate::domain::room::{CreateRoomRequest, CreateRoomResponse, GetRoomResponse};
 use crate::rest::AppState;
 use crate::services::room::CreateRoomError;
 
@@ -43,6 +48,33 @@ pub async fn create_room(
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(json!({"error": format!("failed to create room: {}", e)})),
+        )
+            .into_response(),
+    }
+}
+
+/// 部屋の楽曲情報を取得します
+#[utoipa::path(
+    get,
+    path = "/rooms/{room_id}",
+    params(
+        ("room_id" = String, Path, description = "4桁の部屋ID"),
+    ),
+    responses(
+        (status = StatusCode::OK, body = GetRoomResponse, description = "部屋の楽曲情報を返します。"),
+        (status = StatusCode::NOT_FOUND, description = "部屋が存在しません。"),
+    ),
+    tag = "Room",
+)]
+pub async fn get_room(
+    State(state): State<AppState>,
+    Path(room_id): Path<String>,
+) -> impl IntoResponse {
+    match state.room_service.get_room_song(&room_id) {
+        Some(song) => (StatusCode::OK, Json(GetRoomResponse { song })).into_response(),
+        None => (
+            StatusCode::NOT_FOUND,
+            Json(json!({"error": "room not found"})),
         )
             .into_response(),
     }
