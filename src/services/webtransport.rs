@@ -11,6 +11,7 @@ use axum::extract::Query;
 use serde::Deserialize;
 use tokio::io::AsyncReadExt;
 use tokio::time::sleep;
+use tokio_util::sync::CancellationToken;
 use tracing::{Instrument, debug, info, warn};
 use uuid::Uuid;
 use wtransport::{
@@ -781,10 +782,14 @@ fn handle_live_start(
         ServerMessage::LiveStarted { start_time },
     ));
     // Fire-and-forget: per-beat sync-rate reports are unreliable and the
-    // loop ends after the song's last beat.
+    // loop ends after the song's last beat, or when the room is removed
+    // (the token is cancelled in `remove_room`).
+    let sync_cancel = CancellationToken::new();
+    room_service.set_sync_cancel(room_id.to_string(), sync_cancel.clone());
     tokio::spawn(run_sync_rate_updates(
         room_service.clone(),
         room_id.to_string(),
+        sync_cancel,
     ));
 }
 
@@ -817,27 +822,97 @@ fn handle_shake(
 
 /// Reports the room's sync rate to the host after each beat of the song, as
 /// an unreliable datagram. Beats without any valid shake are skipped; the
-/// loop ends after the song's last beat.
-async fn run_sync_rate_updates(room_service: RoomService, room_id: String) {
+/// loop ends after the song's last beat or when the room is removed (via
+/// `cancellation`).
+async fn run_sync_rate_updates(
+    room_service: RoomService,
+    room_id: String,
+    cancellation: CancellationToken,
+) {
     let Some(beat_times) = room_service.beat_schedule(&room_id) else {
         debug!(
             room_id = %room_id,
             "room is not live, skipping sync-rate updates"
         );
+        room_service.remove_sync_cancel_if_same(&room_id, &cancellation);
         return;
     };
 
+    if cancellation.is_cancelled() {
+        debug!(
+            room_id = %room_id,
+            "sync-rate updates cancelled before start"
+        );
+        room_service.remove_sync_cancel_if_same(&room_id, &cancellation);
+        return;
+    }
+
     for beat_at in beat_times {
+        if cancellation.is_cancelled() {
+            debug!(
+                room_id = %room_id,
+                beat_at,
+                "sync-rate updates cancelled, stopping"
+            );
+            break;
+        }
+        if !room_service.exists(&room_id) {
+            debug!(
+                room_id = %room_id,
+                beat_at,
+                "room was removed, stopping sync-rate updates"
+            );
+            break;
+        }
+
         // Wait until the beat's tolerance window has closed so that all
         // shakes attributed to the beat (including late-arriving reports)
-        // are accounted for.
+        // are accounted for. The wait is cancelled as soon as the room is
+        // removed so the task does not linger through the song.
         let report_at = beat_at.saturating_add(SYNC_REPORT_DELAY_US);
         let now = unix_micros();
         if report_at > now {
-            sleep(Duration::from_micros(report_at - now)).await;
+            tokio::select! {
+                () = sleep(Duration::from_micros(report_at - now)) => {},
+                () = cancellation.cancelled() => {
+                    debug!(
+                        room_id = %room_id,
+                        beat_at,
+                        "sync-rate updates cancelled while waiting, stopping"
+                    );
+                    break;
+                }
+            }
+        }
+
+        if cancellation.is_cancelled() {
+            debug!(
+                room_id = %room_id,
+                beat_at,
+                "sync-rate updates cancelled, stopping"
+            );
+            break;
+        }
+        if !room_service.exists(&room_id) {
+            debug!(
+                room_id = %room_id,
+                beat_at,
+                "room was removed, stopping sync-rate updates"
+            );
+            break;
         }
 
         let Some(rate) = room_service.sync_rate(&room_id, beat_at) else {
+            // `None` means either "no valid shakes" or "room is gone";
+            // only the latter stops the loop.
+            if cancellation.is_cancelled() || !room_service.exists(&room_id) {
+                debug!(
+                    room_id = %room_id,
+                    beat_at,
+                    "room was removed, stopping sync-rate updates"
+                );
+                break;
+            }
             debug!(
                 room_id = %room_id,
                 beat_at,
@@ -848,6 +923,9 @@ async fn run_sync_rate_updates(room_service: RoomService, room_id: String) {
 
         send_datagram_to_host(&room_service, &room_id, &ServerMessage::SyncRate { rate });
     }
+
+    room_service.remove_sync_cancel_if_same(&room_id, &cancellation);
+    debug!(room_id = %room_id, "sync-rate updates stopped");
 }
 
 /// Sends a server-initiated event to the room host as an unreliable
@@ -2410,5 +2488,106 @@ mod tests {
 
         host.close(wtransport::VarInt::from_u32(0), b"done");
         participant.close(wtransport::VarInt::from_u32(0), b"done");
+    }
+
+    #[tokio::test]
+    async fn test_sync_rate_updates_stop_on_host_disconnect() {
+        let room_id = "9899";
+        // Beats far in the future: without cancellation the task would sleep
+        // for seconds after the room is removed.
+        let (room_repo, room_service) =
+            setup_room_service_with_song(room_id, song_with_beats(&[5000.0, 6000.0]));
+
+        let (server_port, cert_hash) = start_server(room_service).await;
+        let client = test_client(cert_hash);
+
+        let host = client
+            .connect(format!(
+                "https://127.0.0.1:{server_port}/rooms/{room_id}?hostToken={HOST_TOKEN}"
+            ))
+            .await
+            .expect("connect as host");
+        sleep(Duration::from_millis(200)).await;
+
+        let start_time = unix_micros() + 1_000_000;
+        let response = send_client_message(&host, &ClientMessage::LiveStart { start_time }).await;
+        assert!(response.is_empty());
+
+        // Wait for the spawned sync-rate task to register its token.
+        let token = timeout(Duration::from_secs(5), async {
+            loop {
+                if let Some(token) = room_repo.sync_cancel_token(room_id) {
+                    return token;
+                }
+                sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("sync-rate token registered");
+        assert!(!token.is_cancelled());
+
+        host.close(wtransport::VarInt::from_u32(0), b"done");
+
+        // The server notices the close, removes the room and cancels the token.
+        timeout(Duration::from_secs(5), async {
+            loop {
+                if !room_repo.exists(room_id) {
+                    return;
+                }
+                sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("room removed after host disconnect");
+        assert!(
+            token.is_cancelled(),
+            "remove_room must cancel the sync-rate task"
+        );
+        assert!(
+            !room_repo.has_sync_cancel(room_id),
+            "cancelled task must not leave a stale token"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_run_sync_rate_updates_exits_promptly_on_cancel() {
+        let room_id = "9900";
+        let (room_repo, room_service) =
+            setup_room_service_with_song(room_id, song_with_beats(&[5000.0, 6000.0]));
+
+        let (server_port, cert_hash) = start_server(room_service.clone()).await;
+        let client = test_client(cert_hash);
+
+        let host = client
+            .connect(format!(
+                "https://127.0.0.1:{server_port}/rooms/{room_id}?hostToken={HOST_TOKEN}"
+            ))
+            .await
+            .expect("connect as host");
+        sleep(Duration::from_millis(200)).await;
+
+        let start_time = unix_micros() + 1_000_000;
+        let response = send_client_message(&host, &ClientMessage::LiveStart { start_time }).await;
+        assert!(response.is_empty());
+        sleep(Duration::from_millis(200)).await;
+
+        // Spawn an extra waiter on far-future beats and cancel it: it must
+        // return well before the first beat instead of sleeping through it.
+        let extra = CancellationToken::new();
+        let handle = tokio::spawn(run_sync_rate_updates(
+            room_service.clone(),
+            room_id.to_string(),
+            extra.clone(),
+        ));
+        sleep(Duration::from_millis(100)).await;
+        extra.cancel();
+        timeout(Duration::from_secs(2), handle)
+            .await
+            .expect("cancelled sync-rate task must finish promptly")
+            .expect("task must not panic");
+
+        // The live's own task is still registered; clean up via disconnect.
+        assert!(room_repo.has_sync_cancel(room_id));
+        host.close(wtransport::VarInt::from_u32(0), b"done");
     }
 }

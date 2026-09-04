@@ -1,4 +1,5 @@
 use rand::RngExt;
+use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 use crate::domain::model::{CompleteSongData, SongData};
@@ -127,6 +128,8 @@ impl RoomService {
     }
 
     /// Removes the room and closes all remaining participant connections (host disconnected).
+    /// The room's sync-rate update task is cancelled via the repository so it
+    /// does not linger after removal.
     pub fn remove_room(&self, room_id: &str) {
         if let Some(room) = self.repo.remove_room(room_id) {
             if let Some(participants) = room.participants() {
@@ -180,6 +183,17 @@ impl RoomService {
     /// schedule per-beat sync-rate reports.
     pub fn beat_schedule(&self, room_id: &str) -> Option<Vec<u64>> {
         self.repo.beat_schedule(room_id)
+    }
+
+    /// Registers the cancellation token for the room's sync-rate update task.
+    pub fn set_sync_cancel(&self, room_id: String, token: CancellationToken) {
+        self.repo.set_sync_cancel(room_id, token);
+    }
+
+    /// Drops the stored sync-rate cancellation token only if it matches
+    /// `token` (see `RoomRepository::remove_sync_cancel_if_same`).
+    pub fn remove_sync_cancel_if_same(&self, room_id: &str, token: &CancellationToken) {
+        self.repo.remove_sync_cancel_if_same(room_id, token);
     }
 }
 
