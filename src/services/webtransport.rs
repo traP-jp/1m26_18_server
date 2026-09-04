@@ -23,7 +23,7 @@ use wtransport::{
 
 use crate::{
     domain::{
-        room::{ClientMessage, SYNC_REPORT_DELAY_US, ServerMessage},
+        room::{ClientMessage, HOST_GRACE_PERIOD, SYNC_REPORT_DELAY_US, ServerMessage},
         wire::{Encode, EncodeError, decode_exact},
     },
     repository::room::{InsertHostError, InsertParticipantError},
@@ -66,6 +66,7 @@ pub struct WebTransportServer {
     endpoint: Endpoint<Server>,
     room_service: RoomService,
     heartbeat_timeout: Duration,
+    host_grace_period: Duration,
 }
 
 impl WebTransportServer {
@@ -83,6 +84,17 @@ impl WebTransportServer {
         room_service: RoomService,
         port: u16,
         heartbeat_timeout: Duration,
+    ) -> Result<(Self, Sha256Digest), WebTransportError> {
+        Self::with_timeouts(room_service, port, heartbeat_timeout, HOST_GRACE_PERIOD)
+    }
+
+    /// Same as [`WebTransportServer::new`] with injectable heartbeat timeout
+    /// and host grace period (tests use short values for both).
+    pub fn with_timeouts(
+        room_service: RoomService,
+        port: u16,
+        heartbeat_timeout: Duration,
+        host_grace_period: Duration,
     ) -> Result<(Self, Sha256Digest), WebTransportError> {
         let identity = Identity::self_signed(["localhost", "127.0.0.1"])?;
 
@@ -107,6 +119,7 @@ impl WebTransportServer {
                 endpoint,
                 room_service,
                 heartbeat_timeout,
+                host_grace_period,
             },
             hash,
         ))
@@ -123,11 +136,17 @@ impl WebTransportServer {
             let incoming_session = self.endpoint.accept().await;
             let room_service = self.room_service.clone();
             let heartbeat_timeout = self.heartbeat_timeout;
+            let host_grace_period = self.host_grace_period;
             let span_id = id;
             id = id.wrapping_add(1);
             tokio::spawn(
-                Self::handle_incoming_session(incoming_session, room_service, heartbeat_timeout)
-                    .instrument(tracing::info_span!("wt_session", span_id)),
+                Self::handle_incoming_session(
+                    incoming_session,
+                    room_service,
+                    heartbeat_timeout,
+                    host_grace_period,
+                )
+                .instrument(tracing::info_span!("wt_session", span_id)),
             );
         }
     }
@@ -136,6 +155,7 @@ impl WebTransportServer {
         incoming_session: IncomingSession,
         room_service: RoomService,
         heartbeat_timeout: Duration,
+        host_grace_period: Duration,
     ) {
         let session_request = match incoming_session.await {
             Ok(req) => req,
@@ -208,8 +228,8 @@ impl WebTransportServer {
             )
             .await;
 
-            info!(room_id = %room_id, host_id = %host_id, "host disconnected, removing room");
-            room_service.remove_room(&room_id);
+            info!(room_id = %room_id, host_id = %host_id, "host disconnected, starting grace period");
+            room_service.disconnect_host(&room_id, &host_id, host_grace_period);
             return;
         }
 
@@ -1067,6 +1087,9 @@ mod tests {
         (room_repo, room_service)
     }
 
+    /// Short grace for tests so host-disconnect removal assertions stay fast.
+    const TEST_GRACE: Duration = Duration::from_millis(100);
+
     async fn start_server(room_service: RoomService) -> (u16, Sha256Digest) {
         start_server_with_timeout(room_service, HEARTBEAT_TIMEOUT).await
     }
@@ -1075,9 +1098,21 @@ mod tests {
         room_service: RoomService,
         heartbeat_timeout: Duration,
     ) -> (u16, Sha256Digest) {
-        let (server, cert_hash) =
-            WebTransportServer::with_heartbeat_timeout(room_service, 0, heartbeat_timeout)
-                .expect("server creation");
+        start_server_with_timeouts(room_service, heartbeat_timeout, TEST_GRACE).await
+    }
+
+    async fn start_server_with_timeouts(
+        room_service: RoomService,
+        heartbeat_timeout: Duration,
+        host_grace_period: Duration,
+    ) -> (u16, Sha256Digest) {
+        let (server, cert_hash) = WebTransportServer::with_timeouts(
+            room_service,
+            0,
+            heartbeat_timeout,
+            host_grace_period,
+        )
+        .expect("server creation");
         let server_port = server.local_addr().expect("local addr").port();
         tokio::spawn(async move {
             let _ = server.serve().await;
@@ -2589,5 +2624,238 @@ mod tests {
         // The live's own task is still registered; clean up via disconnect.
         assert!(room_repo.has_sync_cancel(room_id));
         host.close(wtransport::VarInt::from_u32(0), b"done");
+    }
+
+    async fn wait_until_room_gone(room_repo: &RoomRepository, room_id: &str) {
+        timeout(Duration::from_secs(5), async {
+            loop {
+                if !room_repo.exists(room_id) {
+                    return;
+                }
+                sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("room should be removed");
+    }
+
+    async fn wait_until_host_disconnected(room_repo: &RoomRepository, room_id: &str) {
+        timeout(Duration::from_secs(5), async {
+            loop {
+                if room_repo.exists(room_id) && room_repo.host_id(room_id).is_none() {
+                    return;
+                }
+                sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("host should enter grace period (room exists, host None)");
+    }
+
+    async fn wait_until_host_connected(room_repo: &RoomRepository, room_id: &str) {
+        timeout(Duration::from_secs(5), async {
+            loop {
+                if room_repo.host_id(room_id).is_some() {
+                    return;
+                }
+                sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("host should be connected");
+    }
+
+    #[tokio::test]
+    async fn test_webtransport_host_reconnect_within_grace_restores_room() {
+        let room_id = "3132";
+        let (room_repo, room_service) = setup_room_service(room_id);
+        let (server_port, cert_hash) =
+            start_server_with_timeouts(room_service, HEARTBEAT_TIMEOUT, Duration::from_secs(2))
+                .await;
+        let client = test_client(cert_hash);
+
+        let host = client
+            .connect(format!(
+                "https://127.0.0.1:{server_port}/rooms/{room_id}?hostToken={HOST_TOKEN}"
+            ))
+            .await
+            .expect("connect as host");
+        wait_until_host_connected(&room_repo, room_id).await;
+        let first_host_id = room_repo.host_id(room_id).expect("host id");
+
+        let participant = client
+            .connect(format!("https://127.0.0.1:{server_port}/rooms/{room_id}"))
+            .await
+            .expect("connect as participant");
+        let participant_id = join_as_participant(&participant).await;
+        // Mark ready so we can verify state survives the reconnect.
+        let response = send_client_message(&participant, &ClientMessage::Ready).await;
+        assert!(response.is_empty());
+        sleep(Duration::from_millis(200)).await;
+        assert_eq!(
+            room_repo.participant_is_ready(room_id, &participant_id),
+            Some(true)
+        );
+        // Drain join + ready notifications.
+        let _ = timeout(Duration::from_secs(2), recv_server_message(&host)).await;
+        let _ = timeout(Duration::from_secs(2), recv_server_message(&host)).await;
+
+        host.close(wtransport::VarInt::from_u32(0), b"done");
+        wait_until_host_disconnected(&room_repo, room_id).await;
+        assert_eq!(room_repo.participant_count(room_id), Some(1));
+
+        // Same token reconnects with a fresh host id; state is preserved.
+        let host2 = client
+            .connect(format!(
+                "https://127.0.0.1:{server_port}/rooms/{room_id}?hostToken={HOST_TOKEN}"
+            ))
+            .await
+            .expect("reconnect as host within grace");
+        wait_until_host_connected(&room_repo, room_id).await;
+        let second_host_id = room_repo.host_id(room_id).expect("host id");
+        assert_ne!(first_host_id, second_host_id);
+        assert_eq!(room_repo.participant_count(room_id), Some(1));
+        assert_eq!(
+            room_repo.participant_is_ready(room_id, &participant_id),
+            Some(true)
+        );
+        assert!(room_repo.exists(room_id));
+
+        // The room accepts new participants again after the reconnect.
+        let newcomer = client
+            .connect(format!("https://127.0.0.1:{server_port}/rooms/{room_id}"))
+            .await
+            .expect("new participant after reconnect");
+        let _ = join_as_participant(&newcomer).await;
+        sleep(Duration::from_millis(200)).await;
+        assert_eq!(room_repo.participant_count(room_id), Some(2));
+
+        host2.close(wtransport::VarInt::from_u32(0), b"done");
+        participant.close(wtransport::VarInt::from_u32(0), b"done");
+        newcomer.close(wtransport::VarInt::from_u32(0), b"done");
+    }
+
+    #[tokio::test]
+    async fn test_webtransport_new_participant_blocked_during_grace() {
+        let room_id = "3133";
+        let (room_repo, room_service) = setup_room_service(room_id);
+        let (server_port, cert_hash) =
+            start_server_with_timeouts(room_service, HEARTBEAT_TIMEOUT, Duration::from_secs(2))
+                .await;
+        let client = test_client(cert_hash);
+
+        let host = client
+            .connect(format!(
+                "https://127.0.0.1:{server_port}/rooms/{room_id}?hostToken={HOST_TOKEN}"
+            ))
+            .await
+            .expect("connect as host");
+        wait_until_host_connected(&room_repo, room_id).await;
+
+        let participant = client
+            .connect(format!("https://127.0.0.1:{server_port}/rooms/{room_id}"))
+            .await
+            .expect("connect as participant");
+        let _ = join_as_participant(&participant).await;
+        assert_eq!(room_repo.participant_count(room_id), Some(1));
+
+        host.close(wtransport::VarInt::from_u32(0), b"done");
+        wait_until_host_disconnected(&room_repo, room_id).await;
+
+        // New joins are blocked while the host is away (it could not be notified).
+        let result = client
+            .connect(format!("https://127.0.0.1:{server_port}/rooms/{room_id}"))
+            .await;
+        assert!(
+            result.is_err(),
+            "new participant must be rejected during host grace period"
+        );
+        assert_eq!(room_repo.participant_count(room_id), Some(1));
+
+        participant.close(wtransport::VarInt::from_u32(0), b"done");
+    }
+
+    #[tokio::test]
+    async fn test_webtransport_host_grace_expiry_removes_room() {
+        let room_id = "3134";
+        let (room_repo, room_service) = setup_room_service(room_id);
+        let (server_port, cert_hash) =
+            start_server_with_timeouts(room_service, HEARTBEAT_TIMEOUT, Duration::from_millis(300))
+                .await;
+        let client = test_client(cert_hash);
+
+        let host = client
+            .connect(format!(
+                "https://127.0.0.1:{server_port}/rooms/{room_id}?hostToken={HOST_TOKEN}"
+            ))
+            .await
+            .expect("connect as host");
+        wait_until_host_connected(&room_repo, room_id).await;
+
+        let participant = client
+            .connect(format!("https://127.0.0.1:{server_port}/rooms/{room_id}"))
+            .await
+            .expect("connect as participant");
+        let _ = join_as_participant(&participant).await;
+        assert_eq!(room_repo.participant_count(room_id), Some(1));
+
+        host.close(wtransport::VarInt::from_u32(0), b"done");
+        // The room survives the disconnect briefly...
+        wait_until_host_disconnected(&room_repo, room_id).await;
+        assert_eq!(room_repo.participant_count(room_id), Some(1));
+        // ...then is removed once the grace period expires.
+        wait_until_room_gone(&room_repo, room_id).await;
+
+        participant.close(wtransport::VarInt::from_u32(0), b"done");
+    }
+
+    #[tokio::test]
+    async fn test_webtransport_host_reconnect_preserves_live_state() {
+        let room_id = "3135";
+        let (room_repo, room_service) = setup_room_service(room_id);
+        let (server_port, cert_hash) =
+            start_server_with_timeouts(room_service, HEARTBEAT_TIMEOUT, Duration::from_secs(2))
+                .await;
+        let client = test_client(cert_hash);
+
+        let host = client
+            .connect(format!(
+                "https://127.0.0.1:{server_port}/rooms/{room_id}?hostToken={HOST_TOKEN}"
+            ))
+            .await
+            .expect("connect as host");
+        wait_until_host_connected(&room_repo, room_id).await;
+
+        let participant = client
+            .connect(format!("https://127.0.0.1:{server_port}/rooms/{room_id}"))
+            .await
+            .expect("connect as participant");
+        let _ = join_as_participant(&participant).await;
+        // Drain the join notification.
+        let _ = timeout(Duration::from_secs(2), recv_server_message(&host)).await;
+
+        let start_time = 1_700_000_000_000_000;
+        let response = send_client_message(&host, &ClientMessage::LiveStart { start_time }).await;
+        assert!(response.is_empty());
+        sleep(Duration::from_millis(200)).await;
+        assert_eq!(room_repo.start_time(room_id), Some(start_time));
+
+        host.close(wtransport::VarInt::from_u32(0), b"done");
+        wait_until_host_disconnected(&room_repo, room_id).await;
+        // Live state is kept during the grace period.
+        assert_eq!(room_repo.start_time(room_id), Some(start_time));
+
+        let host2 = client
+            .connect(format!(
+                "https://127.0.0.1:{server_port}/rooms/{room_id}?hostToken={HOST_TOKEN}"
+            ))
+            .await
+            .expect("reconnect as host within grace");
+        wait_until_host_connected(&room_repo, room_id).await;
+        assert_eq!(room_repo.start_time(room_id), Some(start_time));
+        assert_eq!(room_repo.participant_count(room_id), Some(1));
+
+        host2.close(wtransport::VarInt::from_u32(0), b"done");
+        participant.close(wtransport::VarInt::from_u32(0), b"done");
     }
 }

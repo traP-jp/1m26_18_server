@@ -13,6 +13,10 @@ pub struct RoomRepository {
     /// Cancellation tokens for per-room `run_sync_rate_updates` tasks.
     /// Kept outside `Room` so the domain layer stays free of tokio types.
     sync_cancels: Arc<RwLock<HashMap<String, CancellationToken>>>,
+    /// Cancellation tokens for per-room host grace-period timers.
+    /// `(disconnected host id, token)` is stored so a stale timer cannot
+    /// remove a reconnected or recreated room.
+    host_grace_cancels: Arc<RwLock<HashMap<String, (Uuid, CancellationToken)>>>,
 }
 
 impl RoomRepository {
@@ -20,6 +24,7 @@ impl RoomRepository {
         Self {
             inner: Arc::new(RwLock::new(HashMap::new())),
             sync_cancels: Arc::new(RwLock::new(HashMap::new())),
+            host_grace_cancels: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 
@@ -39,15 +44,20 @@ impl RoomRepository {
             .map(|room| room.song().clone())
     }
 
-    /// Returns whether the room's host has joined. Participants may join a
-    /// room only after its host.
+    /// Returns whether the room's host is currently connected. Participants
+    /// may join a room only while this is `true`: before the first host join
+    /// and during the post-disconnect grace period it is `false` so new
+    /// joins are blocked (the absent host could not be notified).
     pub fn host_joined(&self, room_id: &str) -> bool {
-        matches!(self.inner.read().get(room_id), Some(Room::HostJoined(_)))
+        self.inner
+            .read()
+            .get(room_id)
+            .is_some_and(Room::is_host_connected)
     }
 
     /// Registers a participant in the room. Returns an error if the room does
-    /// not exist, its host has not joined yet, or the live has already
-    /// started.
+    /// not exist, its host is not currently connected (not yet joined or in
+    /// the post-disconnect grace period), or the live has already started.
     pub fn insert_participant(
         &self,
         room_id: &str,
@@ -57,6 +67,9 @@ impl RoomRepository {
         let mut map = self.inner.write();
         match map.get_mut(room_id) {
             Some(room) => {
+                if !room.is_host_connected() {
+                    return Err(InsertParticipantError::HostNotJoined);
+                }
                 if matches!(room, Room::Live(_)) {
                     return Err(InsertParticipantError::LiveStarted);
                 }
@@ -99,6 +112,11 @@ impl RoomRepository {
     }
 
     /// Validates the host token against the room state.
+    ///
+    /// The initial join (`Waiting` + matching token) and a reconnect during
+    /// the grace period (disconnected + matching token) are accepted. A
+    /// second host while one is connected is rejected with
+    /// [`InsertHostError::HostAlreadyJoined`].
     pub fn validate_host_token(&self, room_id: &str, token: &str) -> Result<(), InsertHostError> {
         match self.inner.read().get(room_id) {
             Some(Room::Waiting(waiting)) => {
@@ -108,12 +126,25 @@ impl RoomRepository {
                     Err(InsertHostError::InvalidToken)
                 }
             }
-            Some(Room::HostJoined(_) | Room::Live(_)) => Err(InsertHostError::HostAlreadyJoined),
+            Some(room @ (Room::HostJoined(_) | Room::Live(_))) => {
+                if room.is_host_connected() {
+                    return Err(InsertHostError::HostAlreadyJoined);
+                }
+                if room.host_token().is_some_and(|t| t == token) {
+                    Ok(())
+                } else {
+                    Err(InsertHostError::InvalidToken)
+                }
+            }
             None => Err(InsertHostError::RoomNotFound),
         }
     }
 
-    /// Validates the host token and transitions the room to host-joined, atomically.
+    /// Validates the host token and registers the host connection,
+    /// atomically. Handles both the initial join (`Waiting` -> `HostJoined`)
+    /// and a reconnect during the grace period (same token, host slot empty).
+    /// A reconnect issues a fresh host id; callers must cancel the pending
+    /// grace timer (see `cancel_host_grace`).
     pub fn insert_host(
         &self,
         room_id: &str,
@@ -122,13 +153,27 @@ impl RoomRepository {
         connection: wtransport::Connection,
     ) -> Result<(), InsertHostError> {
         let mut map = self.inner.write();
-        let waiting = match map.remove(room_id) {
-            Some(Room::Waiting(waiting)) => waiting,
+        match map.get_mut(room_id) {
+            Some(Room::Waiting(_)) => {}
             Some(room @ (Room::HostJoined(_) | Room::Live(_))) => {
-                map.insert(room_id.to_string(), room);
-                return Err(InsertHostError::HostAlreadyJoined);
+                if room.is_host_connected() {
+                    return Err(InsertHostError::HostAlreadyJoined);
+                }
+                if room.host_token().is_some_and(|t| t == token) {
+                    // Grace-period reconnect: keep participants / live state.
+                    room.reconnect_host(Host::new(host_id, connection));
+                    return Ok(());
+                }
+                return Err(InsertHostError::InvalidToken);
             }
             None => return Err(InsertHostError::RoomNotFound),
+        }
+        // Initial join: consume the `Waiting` room. The borrow above has ended.
+        let waiting = match map.remove(room_id) {
+            Some(Room::Waiting(waiting)) => waiting,
+            // Re-checked above; another task cannot interleave thanks to the
+            // write lock, so any other state is unreachable.
+            _ => return Err(InsertHostError::RoomNotFound),
         };
         if waiting.host_token() != token {
             map.insert(room_id.to_string(), Room::Waiting(waiting));
@@ -141,12 +186,59 @@ impl RoomRepository {
         Ok(())
     }
 
+    /// Marks the host as disconnected (grace period start). Returns `true`
+    /// only if `host_id` matches the currently connected host; otherwise the
+    /// call is a no-op (e.g. a stale connection task racing a reconnect).
+    pub fn disconnect_host(&self, room_id: &str, host_id: &Uuid) -> bool {
+        match self.inner.write().get_mut(room_id) {
+            Some(room) => room.disconnect_host(host_id),
+            None => false,
+        }
+    }
+
+    /// Registers the cancellation token for the room's host grace-period
+    /// timer. Overwrites any previous timer for the room.
+    pub fn set_host_grace_cancel(&self, room_id: String, host_id: Uuid, token: CancellationToken) {
+        self.host_grace_cancels
+            .write()
+            .insert(room_id, (host_id, token));
+    }
+
+    /// Cancels and drops the room's host grace-period timer, if any. Called
+    /// when the host reconnects within the grace period.
+    pub fn cancel_host_grace(&self, room_id: &str) {
+        if let Some((_, token)) = self.host_grace_cancels.write().remove(room_id) {
+            token.cancel();
+        }
+    }
+
+    /// Drops the stored grace timer only if it is the same generation as
+    /// `token` (same cancellation graph) and its disconnected host id still
+    /// matches `host_id`. Returns `true` when the caller owns the current
+    /// generation and may proceed with room removal.
+    pub fn take_host_grace_if_same(
+        &self,
+        room_id: &str,
+        host_id: &Uuid,
+        token: &CancellationToken,
+    ) -> bool {
+        let mut cancels = self.host_grace_cancels.write();
+        match cancels.get(room_id) {
+            Some((stored_id, stored)) if stored_id == host_id && stored == token => {
+                cancels.remove(room_id);
+                true
+            }
+            _ => false,
+        }
+    }
+
     /// Returns a clone of the room host's connection. `None` if the room does
-    /// not exist or the host has not joined yet.
+    /// not exist, the host has not joined yet, or the host is in the
+    /// post-disconnect grace period.
     pub fn host_connection(&self, room_id: &str) -> Option<wtransport::Connection> {
         match self.inner.read().get(room_id) {
-            Some(Room::HostJoined(joined)) => Some(joined.host().connection().clone()),
-            Some(Room::Live(live)) => Some(live.host().connection().clone()),
+            Some(Room::HostJoined(joined)) => joined.host().map(|h| h.connection().clone()),
+            Some(Room::Live(live)) => live.host().map(|h| h.connection().clone()),
             _ => None,
         }
     }
@@ -171,8 +263,10 @@ impl RoomRepository {
 
     /// Removes and returns the room. Returns `None` if the room does not exist.
     /// Any sync-rate update task is cancelled first so it does not linger.
+    /// Any pending host grace timer entry is dropped as well.
     pub fn remove_room(&self, room_id: &str) -> Option<Room> {
         self.cancel_sync_updates(room_id);
+        self.host_grace_cancels.write().remove(room_id);
         self.inner.write().remove(room_id)
     }
 
@@ -285,8 +379,8 @@ impl RoomRepository {
     #[cfg(test)]
     pub fn host_id(&self, room_id: &str) -> Option<Uuid> {
         match self.inner.read().get(room_id) {
-            Some(Room::HostJoined(joined)) => Some(joined.host().id()),
-            Some(Room::Live(live)) => Some(live.host().id()),
+            Some(Room::HostJoined(joined)) => joined.host().map(Host::id),
+            Some(Room::Live(live)) => live.host().map(Host::id),
             _ => None,
         }
     }
@@ -325,6 +419,11 @@ impl RoomRepository {
     #[cfg(test)]
     pub fn sync_cancel_token(&self, room_id: &str) -> Option<CancellationToken> {
         self.sync_cancels.read().get(room_id).cloned()
+    }
+
+    #[cfg(test)]
+    pub fn has_host_grace(&self, room_id: &str) -> bool {
+        self.host_grace_cancels.read().contains_key(room_id)
     }
 }
 

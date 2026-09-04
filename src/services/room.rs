@@ -1,9 +1,12 @@
+use std::time::Duration;
+
 use rand::RngExt;
+use tokio::time::sleep;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 use crate::domain::model::{CompleteSongData, SongData};
-use crate::domain::room::{Room, WaitingRoom};
+use crate::domain::room::{HOST_GRACE_PERIOD, Room, WaitingRoom};
 use crate::repository::room::{
     InsertHostError, InsertParticipantError, RoomRepository, SetReadyError, ShakeError,
     StartLiveError,
@@ -84,13 +87,17 @@ impl RoomService {
         self.repo.validate_host_token(room_id, token)
     }
 
-    /// Returns whether the room's host has joined. Participants may join a
-    /// room only after its host.
+    /// Returns whether the room's host is currently connected. Participants
+    /// may join a room only while this is `true`; during the post-disconnect
+    /// grace period it is `false` so new joins are blocked.
     pub fn host_joined(&self, room_id: &str) -> bool {
         self.repo.host_joined(room_id)
     }
 
     /// Validates the host token and registers the connection as the room's host.
+    /// Handles both the initial join and a reconnect within the grace period
+    /// (same token). A reconnect issues a fresh host id and cancels the
+    /// pending grace-period removal.
     pub fn join_room_as_host(
         &self,
         room_id: &str,
@@ -99,6 +106,7 @@ impl RoomService {
     ) -> Result<Uuid, InsertHostError> {
         let host_id = Uuid::now_v7();
         self.repo.insert_host(room_id, token, host_id, connection)?;
+        self.repo.cancel_host_grace(room_id);
 
         tracing::info!(room_id = %room_id, host_id = %host_id, "host joined room");
 
@@ -127,7 +135,51 @@ impl RoomService {
         Ok(())
     }
 
-    /// Removes the room and closes all remaining participant connections (host disconnected).
+    /// Marks the host as disconnected and schedules room removal after
+    /// `grace` unless the same-token host reconnects first.
+    ///
+    /// The sync-rate update task is intentionally kept alive during the grace
+    /// period so a reconnected host resumes receiving reports; it is only
+    /// cancelled by the eventual `remove_room`.
+    pub fn disconnect_host(&self, room_id: &str, host_id: &Uuid, grace: Duration) {
+        if !self.repo.disconnect_host(room_id, host_id) {
+            return;
+        }
+        tracing::info!(room_id = %room_id, host_id = %host_id, "host disconnected, grace period started");
+
+        let service = self.clone();
+        let room_id_owned = room_id.to_string();
+        let host_id_owned = *host_id;
+        let token = CancellationToken::new();
+        self.repo
+            .set_host_grace_cancel(room_id_owned.clone(), host_id_owned, token.clone());
+        tokio::spawn(async move {
+            tokio::select! {
+                () = sleep(grace) => {},
+                () = token.cancelled() => {
+                    tracing::debug!(room_id = %room_id_owned, "host grace timer cancelled (reconnected)");
+                    return;
+                }
+            }
+            if !service
+                .repo
+                .take_host_grace_if_same(&room_id_owned, &host_id_owned, &token)
+            {
+                // Reconnected (or room recreated): a newer generation owns the slot.
+                return;
+            }
+            service.remove_room(&room_id_owned);
+            tracing::info!(room_id = %room_id_owned, "room removed after host grace expiry");
+        });
+    }
+
+    /// Same as [`RoomService::disconnect_host`] with [`HOST_GRACE_PERIOD`].
+    pub fn disconnect_host_with_default_grace(&self, room_id: &str, host_id: &Uuid) {
+        self.disconnect_host(room_id, host_id, HOST_GRACE_PERIOD);
+    }
+
+    /// Removes the room and closes all remaining participant connections.
+    /// Called after the host grace period expires (or directly in tests).
     /// The room's sync-rate update task is cancelled via the repository so it
     /// does not linger after removal.
     pub fn remove_room(&self, room_id: &str) {

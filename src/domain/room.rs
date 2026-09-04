@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::{collections::HashMap, time::Duration};
 
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
@@ -15,6 +15,13 @@ pub const SYNC_TOLERANCE_US: i64 = 100_000;
 /// to the host, so that shakes within the beat's tolerance window (including
 /// late-arriving reports) have time to arrive.
 pub const SYNC_REPORT_DELAY_US: u64 = 200_000;
+
+/// Grace period after the host disconnects before the room is removed.
+///
+/// If a host with the same token reconnects within this period, the room
+/// (participants, readiness, live state, shakes) is restored. Otherwise the
+/// room is removed and remaining participant connections are closed.
+pub const HOST_GRACE_PERIOD: Duration = Duration::from_secs(20);
 
 pub enum Room {
     Waiting(WaitingRoom),
@@ -63,6 +70,68 @@ impl Room {
             Room::Live(live) => Some(live.as_mut()),
         }
     }
+
+    /// Returns the room's host token, regardless of the room state.
+    pub fn host_token(&self) -> Option<&str> {
+        match self {
+            Room::Waiting(waiting) => Some(waiting.host_token()),
+            Room::HostJoined(joined) => Some(joined.host_token()),
+            Room::Live(live) => Some(live.host_token()),
+        }
+    }
+
+    /// Returns the room's connected host, if any. `None` while waiting for
+    /// the host or during the post-disconnect grace period.
+    pub fn host(&self) -> Option<&Host> {
+        match self {
+            Room::Waiting(_) => None,
+            Room::HostJoined(joined) => joined.host(),
+            Room::Live(live) => live.host(),
+        }
+    }
+
+    /// Whether the host is currently connected. New participants may join
+    /// only while this is `true`; during the grace period (`false`) joins
+    /// are blocked because the host cannot be notified.
+    pub fn is_host_connected(&self) -> bool {
+        match self {
+            Room::Waiting(_) => false,
+            Room::HostJoined(joined) => joined.host().is_some(),
+            Room::Live(live) => live.host().is_some(),
+        }
+    }
+
+    /// Marks the host as disconnected (grace period start). Returns `true`
+    /// only if `host_id` matches the currently connected host.
+    pub(crate) fn disconnect_host(&mut self, host_id: &Uuid) -> bool {
+        match self {
+            Room::Waiting(_) => false,
+            Room::HostJoined(joined) => joined.disconnect_host(host_id),
+            Room::Live(live) => live.disconnect_host(host_id),
+        }
+    }
+
+    /// Restores the host connection during the grace period. Returns `true`
+    /// only if the room is currently disconnected (grace period active).
+    pub(crate) fn reconnect_host(&mut self, host: Host) -> bool {
+        match self {
+            Room::Waiting(_) => false,
+            Room::HostJoined(joined) => {
+                if joined.host().is_some() {
+                    return false;
+                }
+                joined.reconnect_host(host);
+                true
+            }
+            Room::Live(live) => {
+                if live.host().is_some() {
+                    return false;
+                }
+                live.reconnect_host(host);
+                true
+            }
+        }
+    }
 }
 
 pub struct Host {
@@ -104,7 +173,8 @@ impl WaitingRoom {
 
     pub fn join_host(self, host: Host) -> HostJoinedRoom {
         HostJoinedRoom {
-            host,
+            host: Some(host),
+            host_token: self.host_token,
             song: self.song,
             participants: HashMap::new(),
         }
@@ -137,18 +207,37 @@ impl Participant {
 }
 
 pub struct HostJoinedRoom {
-    host: Host,
+    host: Option<Host>,
+    host_token: String,
     song: CompleteSongData,
     participants: HashMap<Uuid, Participant>,
 }
 
 impl HostJoinedRoom {
-    pub fn host(&self) -> &Host {
-        &self.host
+    pub fn host(&self) -> Option<&Host> {
+        self.host.as_ref()
+    }
+
+    pub fn host_token(&self) -> &str {
+        &self.host_token
     }
 
     pub fn song(&self) -> &CompleteSongData {
         &self.song
+    }
+
+    pub(crate) fn disconnect_host(&mut self, host_id: &Uuid) -> bool {
+        match self.host.as_ref() {
+            Some(host) if host.id() == *host_id => {
+                self.host = None;
+                true
+            }
+            _ => false,
+        }
+    }
+
+    pub(crate) fn reconnect_host(&mut self, host: Host) {
+        self.host = Some(host);
     }
 
     /// Marks a participant as ready. Returns whether this call caused the
@@ -167,6 +256,7 @@ impl HostJoinedRoom {
     pub fn start_live(self, start_time: u64) -> LiveRoom {
         LiveRoom {
             host: self.host,
+            host_token: self.host_token,
             song: self.song,
             participants: self.participants,
             shakes: HashMap::new(),
@@ -178,7 +268,8 @@ impl HostJoinedRoom {
 /// A room whose live has started, carrying the start time announced by the
 /// host.
 pub struct LiveRoom {
-    host: Host,
+    host: Option<Host>,
+    host_token: String,
     song: CompleteSongData,
     participants: HashMap<Uuid, Participant>,
     /// Reported device-shake times (unix microseconds), per participant.
@@ -188,12 +279,30 @@ pub struct LiveRoom {
 }
 
 impl LiveRoom {
-    pub fn host(&self) -> &Host {
-        &self.host
+    pub fn host(&self) -> Option<&Host> {
+        self.host.as_ref()
+    }
+
+    pub fn host_token(&self) -> &str {
+        &self.host_token
     }
 
     pub fn song(&self) -> &CompleteSongData {
         &self.song
+    }
+
+    pub(crate) fn disconnect_host(&mut self, host_id: &Uuid) -> bool {
+        match self.host.as_ref() {
+            Some(host) if host.id() == *host_id => {
+                self.host = None;
+                true
+            }
+            _ => false,
+        }
+    }
+
+    pub(crate) fn reconnect_host(&mut self, host: Host) {
+        self.host = Some(host);
     }
 
     /// The live start time (unix microseconds) announced by the host.
