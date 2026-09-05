@@ -113,10 +113,10 @@ impl RoomRepository {
 
     /// Validates the host token against the room state.
     ///
-    /// The initial join (`Waiting` + matching token) and a reconnect during
-    /// the grace period (disconnected + matching token) are accepted. A
-    /// second host while one is connected is rejected with
-    /// [`InsertHostError::HostAlreadyJoined`].
+    /// The initial join (`Waiting` + matching token), a reconnect during the
+    /// grace period (disconnected + matching token), and a takeover while a
+    /// host is still connected (connected + matching token) are accepted. A
+    /// mismatched token is rejected with [`InsertHostError::InvalidToken`].
     pub fn validate_host_token(&self, room_id: &str, token: &str) -> Result<(), InsertHostError> {
         match self.inner.read().get(room_id) {
             Some(Room::Waiting(waiting)) => {
@@ -127,9 +127,6 @@ impl RoomRepository {
                 }
             }
             Some(room @ (Room::HostJoined(_) | Room::Live(_))) => {
-                if room.is_host_connected() {
-                    return Err(InsertHostError::HostAlreadyJoined);
-                }
                 if room.host_token().is_some_and(|t| t == token) {
                     Ok(())
                 } else {
@@ -141,28 +138,31 @@ impl RoomRepository {
     }
 
     /// Validates the host token and registers the host connection,
-    /// atomically. Handles both the initial join (`Waiting` -> `HostJoined`)
-    /// and a reconnect during the grace period (same token, host slot empty).
-    /// A reconnect issues a fresh host id; callers must cancel the pending
-    /// grace timer (see `cancel_host_grace`).
+    /// atomically. Handles the initial join (`Waiting` -> `HostJoined`), a
+    /// reconnect during the grace period (same token, host slot empty), and a
+    /// takeover while a host is still connected (same token, host slot
+    /// occupied). Participants / live state are preserved on reconnect and
+    /// takeover. A reconnect or initial join issues a fresh host id; callers
+    /// must cancel the pending grace timer (see `cancel_host_grace`).
+    ///
+    /// Returns the previous host connection when an active host was replaced;
+    /// the caller is responsible for closing it immediately.
     pub fn insert_host(
         &self,
         room_id: &str,
         token: &str,
         host_id: Uuid,
         connection: wtransport::Connection,
-    ) -> Result<(), InsertHostError> {
+    ) -> Result<Option<wtransport::Connection>, InsertHostError> {
         let mut map = self.inner.write();
         match map.get_mut(room_id) {
             Some(Room::Waiting(_)) => {}
             Some(room @ (Room::HostJoined(_) | Room::Live(_))) => {
-                if room.is_host_connected() {
-                    return Err(InsertHostError::HostAlreadyJoined);
-                }
                 if room.host_token().is_some_and(|t| t == token) {
-                    // Grace-period reconnect: keep participants / live state.
-                    room.reconnect_host(Host::new(host_id, connection));
-                    return Ok(());
+                    // Grace-period reconnect or active-host takeover: keep
+                    // participants / live state.
+                    let old = room.replace_host(Host::new(host_id, connection));
+                    return Ok(old.map(|host| host.connection().clone()));
                 }
                 return Err(InsertHostError::InvalidToken);
             }
@@ -183,12 +183,13 @@ impl RoomRepository {
             room_id.to_string(),
             Room::HostJoined(Box::new(waiting.join_host(Host::new(host_id, connection)))),
         );
-        Ok(())
+        Ok(None)
     }
 
     /// Marks the host as disconnected (grace period start). Returns `true`
     /// only if `host_id` matches the currently connected host; otherwise the
-    /// call is a no-op (e.g. a stale connection task racing a reconnect).
+    /// call is a no-op (e.g. a stale connection task racing a reconnect or a
+    /// replaced host racing a takeover).
     pub fn disconnect_host(&self, room_id: &str, host_id: &Uuid) -> bool {
         match self.inner.write().get_mut(room_id) {
             Some(room) => room.disconnect_host(host_id),

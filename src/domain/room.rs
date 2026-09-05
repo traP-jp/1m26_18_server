@@ -111,25 +111,18 @@ impl Room {
         }
     }
 
-    /// Restores the host connection during the grace period. Returns `true`
-    /// only if the room is currently disconnected (grace period active).
-    pub(crate) fn reconnect_host(&mut self, host: Host) -> bool {
+    /// Replaces the host connection, whether or not a host is currently
+    /// connected. Returns the previous host, if any.
+    ///
+    /// Used when a new connection arrives with a valid host token while an
+    /// old host is still connected: the new connection takes over and the
+    /// caller is responsible for closing the old one. Participants, live
+    /// state and shakes are preserved.
+    pub(crate) fn replace_host(&mut self, host: Host) -> Option<Host> {
         match self {
-            Room::Waiting(_) => false,
-            Room::HostJoined(joined) => {
-                if joined.host().is_some() {
-                    return false;
-                }
-                joined.reconnect_host(host);
-                true
-            }
-            Room::Live(live) => {
-                if live.host().is_some() {
-                    return false;
-                }
-                live.reconnect_host(host);
-                true
-            }
+            Room::Waiting(_) => None,
+            Room::HostJoined(joined) => joined.replace_host(host),
+            Room::Live(live) => live.replace_host(host),
         }
     }
 }
@@ -236,8 +229,8 @@ impl HostJoinedRoom {
         }
     }
 
-    pub(crate) fn reconnect_host(&mut self, host: Host) {
-        self.host = Some(host);
+    pub(crate) fn replace_host(&mut self, host: Host) -> Option<Host> {
+        self.host.replace(host)
     }
 
     /// Marks a participant as ready. Returns whether this call caused the
@@ -301,8 +294,8 @@ impl LiveRoom {
         }
     }
 
-    pub(crate) fn reconnect_host(&mut self, host: Host) {
-        self.host = Some(host);
+    pub(crate) fn replace_host(&mut self, host: Host) -> Option<Host> {
+        self.host.replace(host)
     }
 
     /// The live start time (unix microseconds) announced by the host.

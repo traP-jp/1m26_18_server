@@ -95,9 +95,12 @@ impl RoomService {
     }
 
     /// Validates the host token and registers the connection as the room's host.
-    /// Handles both the initial join and a reconnect within the grace period
-    /// (same token). A reconnect issues a fresh host id and cancels the
-    /// pending grace-period removal.
+    /// Handles the initial join, a reconnect within the grace period, and a
+    /// takeover while a host is still connected (same token). A reconnect or
+    /// takeover issues a fresh host id and cancels the pending grace-period
+    /// removal. On takeover the previous host connection is closed
+    /// immediately; its connection task then exits and its stale
+    /// `disconnect_host` becomes a no-op via the host-id check.
     pub fn join_room_as_host(
         &self,
         room_id: &str,
@@ -105,10 +108,15 @@ impl RoomService {
         connection: wtransport::Connection,
     ) -> Result<Uuid, InsertHostError> {
         let host_id = Uuid::now_v7();
-        self.repo.insert_host(room_id, token, host_id, connection)?;
+        let replaced = self.repo.insert_host(room_id, token, host_id, connection)?;
         self.repo.cancel_host_grace(room_id);
 
-        tracing::info!(room_id = %room_id, host_id = %host_id, "host joined room");
+        if let Some(old_connection) = replaced {
+            old_connection.close(wtransport::VarInt::from_u32(409), b"host replaced");
+            tracing::info!(room_id = %room_id, host_id = %host_id, "host replaced previous host");
+        } else {
+            tracing::info!(room_id = %room_id, host_id = %host_id, "host joined room");
+        }
 
         Ok(host_id)
     }

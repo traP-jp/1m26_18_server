@@ -1496,7 +1496,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_webtransport_second_host_rejected() {
+    async fn test_webtransport_second_host_replaces_first() {
         let room_id = "6666";
         let (room_repo, room_service) = setup_room_service(room_id);
 
@@ -1510,17 +1510,49 @@ mod tests {
             .await
             .expect("first host connect");
         sleep(Duration::from_millis(200)).await;
-        assert!(room_repo.host_id(room_id).is_some());
+        let first_host_id = room_repo.host_id(room_id).expect("first host id");
+
+        // A wrong token is still rejected while a host is connected.
+        let wrong = client
+            .connect(format!(
+                "https://127.0.0.1:{server_port}/rooms/{room_id}?hostToken=wrong-token"
+            ))
+            .await;
+        assert!(wrong.is_err(), "wrong host token must be rejected");
 
         let second = client
             .connect(format!(
                 "https://127.0.0.1:{server_port}/rooms/{room_id}?hostToken={HOST_TOKEN}"
             ))
-            .await;
-        assert!(second.is_err(), "expected second host connect to fail");
-        assert!(room_repo.host_id(room_id).is_some());
+            .await
+            .expect("second host connect with same token replaces first");
+        // Wait until the replacement is registered.
+        timeout(Duration::from_secs(5), async {
+            loop {
+                if let Some(id) = room_repo.host_id(room_id)
+                    && id != first_host_id
+                {
+                    break;
+                }
+                sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("host should be replaced");
+        let second_host_id = room_repo.host_id(room_id).expect("second host id");
+        assert_ne!(first_host_id, second_host_id);
+        assert!(room_repo.exists(room_id));
 
+        // The stale first connection must not tear down the room on close.
         first.close(wtransport::VarInt::from_u32(0), b"done");
+        sleep(Duration::from_millis(300)).await;
+        assert!(
+            room_repo.exists(room_id),
+            "room must survive stale host disconnect after takeover"
+        );
+        assert_eq!(room_repo.host_id(room_id), Some(second_host_id));
+
+        second.close(wtransport::VarInt::from_u32(0), b"done");
         sleep(Duration::from_millis(300)).await;
         assert!(!room_repo.exists(room_id));
     }
