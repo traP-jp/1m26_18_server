@@ -8,8 +8,7 @@ use uuid::Uuid;
 use crate::domain::model::{CompleteSongData, SongData};
 use crate::domain::room::{HOST_GRACE_PERIOD, Room, WaitingRoom};
 use crate::repository::room::{
-    InsertHostError, InsertParticipantError, RoomRepository, SetReadyError, ShakeError,
-    StartLiveError,
+    InsertHostError, InsertParticipantError, RoomRepository, SetReadyError, StartLiveError,
 };
 use crate::services::song::{SongService, SongServiceError};
 
@@ -145,10 +144,6 @@ impl RoomService {
 
     /// Marks the host as disconnected and schedules room removal after
     /// `grace` unless the same-token host reconnects first.
-    ///
-    /// The sync-rate update task is intentionally kept alive during the grace
-    /// period so a reconnected host resumes receiving reports; it is only
-    /// cancelled by the eventual `remove_room`.
     pub fn disconnect_host(&self, room_id: &str, host_id: &Uuid, grace: Duration) {
         if !self.repo.disconnect_host(room_id, host_id) {
             return;
@@ -188,8 +183,6 @@ impl RoomService {
 
     /// Removes the room and closes all remaining participant connections.
     /// Called after the host grace period expires (or directly in tests).
-    /// The room's sync-rate update task is cancelled via the repository so it
-    /// does not linger after removal.
     pub fn remove_room(&self, room_id: &str) {
         if let Some(room) = self.repo.remove_room(room_id) {
             if let Some(participants) = room.participants() {
@@ -211,49 +204,6 @@ impl RoomService {
     /// Returns a clone of the room's song data. `None` if the room does not exist.
     pub fn get_room_song(&self, room_id: &str) -> Option<CompleteSongData> {
         self.repo.get_song(room_id)
-    }
-
-    /// Records one participant device-shake report (sent unreliably as a
-    /// datagram).
-    pub fn record_shake(
-        &self,
-        room_id: &str,
-        participant_id: &Uuid,
-        detected_at: u64,
-    ) -> Result<(), ShakeError> {
-        self.repo
-            .record_shake(room_id, *participant_id, detected_at)?;
-        tracing::debug!(
-            room_id = %room_id,
-            participant_id = %participant_id,
-            detected_at,
-            "participant device shake recorded"
-        );
-        Ok(())
-    }
-
-    /// The room's overall sync rate (0-100) of the device shakes attributed
-    /// to the beat starting at `beat_at`, or `None` if no valid shake falls
-    /// within the beat's tolerance window.
-    pub fn sync_rate(&self, room_id: &str, beat_at: u64) -> Option<u8> {
-        self.repo.sync_rate(room_id, beat_at)
-    }
-
-    /// Absolute start times (unix microseconds) of the live's beats, used to
-    /// schedule per-beat sync-rate reports.
-    pub fn beat_schedule(&self, room_id: &str) -> Option<Vec<u64>> {
-        self.repo.beat_schedule(room_id)
-    }
-
-    /// Registers the cancellation token for the room's sync-rate update task.
-    pub fn set_sync_cancel(&self, room_id: String, token: CancellationToken) {
-        self.repo.set_sync_cancel(room_id, token);
-    }
-
-    /// Drops the stored sync-rate cancellation token only if it matches
-    /// `token` (see `RoomRepository::remove_sync_cancel_if_same`).
-    pub fn remove_sync_cancel_if_same(&self, room_id: &str, token: &CancellationToken) {
-        self.repo.remove_sync_cancel_if_same(room_id, token);
     }
 }
 

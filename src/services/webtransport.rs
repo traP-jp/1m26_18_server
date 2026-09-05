@@ -11,7 +11,6 @@ use axum::extract::Query;
 use serde::Deserialize;
 use tokio::io::AsyncReadExt;
 use tokio::time::sleep;
-use tokio_util::sync::CancellationToken;
 use tracing::{Instrument, debug, info, warn};
 use uuid::Uuid;
 use wtransport::{
@@ -23,7 +22,7 @@ use wtransport::{
 
 use crate::{
     domain::{
-        room::{ClientMessage, HOST_GRACE_PERIOD, SYNC_REPORT_DELAY_US, ServerMessage},
+        room::{ClientMessage, HOST_GRACE_PERIOD, ServerMessage},
         wire::{Encode, EncodeError, decode_exact},
     },
     repository::room::{InsertHostError, InsertParticipantError},
@@ -513,9 +512,9 @@ async fn handle_datagrams(
         };
 
         match decode_exact::<ClientMessage>(&datagram.payload()) {
-            Ok(ClientMessage::Shake { detected_at }) => {
+            Ok(ClientMessage::Shake) => {
                 *last_seen.lock() = Instant::now();
-                handle_shake(&room_service, &room_id, client_id, is_host, detected_at);
+                handle_shake(&room_service, &room_id, client_id, is_host);
             }
             Ok(message) => {
                 debug!(
@@ -645,11 +644,11 @@ async fn handle_bi_stream(
             handle_live_start(room_service, room_id, client_id, is_host, start_time);
             None
         }
-        ClientMessage::Shake { detected_at } => {
+        ClientMessage::Shake => {
             // Shakes are expected on the unreliable datagram channel; for
-            // robustness a shake reported on a stream is recorded the same
+            // robustness a shake reported on a stream is relayed the same
             // way. Fire-and-forget: no response is written.
-            handle_shake(room_service, room_id, client_id, is_host, detected_at);
+            handle_shake(room_service, room_id, client_id, is_host);
             None
         }
     };
@@ -801,27 +800,12 @@ fn handle_live_start(
         room_id.to_string(),
         ServerMessage::LiveStarted { start_time },
     ));
-    // Fire-and-forget: per-beat sync-rate reports are unreliable and the
-    // loop ends after the song's last beat, or when the room is removed
-    // (the token is cancelled in `remove_room`).
-    let sync_cancel = CancellationToken::new();
-    room_service.set_sync_cancel(room_id.to_string(), sync_cancel.clone());
-    tokio::spawn(run_sync_rate_updates(
-        room_service.clone(),
-        room_id.to_string(),
-        sync_cancel,
-    ));
 }
 
-/// Records a participant's device-shake report (sent unreliably as a
-/// datagram) for per-beat sync-rate calculation.
-fn handle_shake(
-    room_service: &RoomService,
-    room_id: &str,
-    participant_id: Uuid,
-    is_host: bool,
-    detected_at: u64,
-) {
+/// Relays a participant's device-shake report to the host as an unreliable
+/// datagram, without server-side aggregation. The host scores timing from
+/// the receipt time.
+fn handle_shake(room_service: &RoomService, room_id: &str, participant_id: Uuid, is_host: bool) {
     if is_host {
         warn!(
             room_id = %room_id,
@@ -830,122 +814,18 @@ fn handle_shake(
         );
         return;
     }
-    if let Err(e) = room_service.record_shake(room_id, &participant_id, detected_at) {
-        warn!(
-            room_id = %room_id,
-            participant_id = %participant_id,
-            error = %e,
-            "failed to record device shake"
-        );
-    }
-}
-
-/// Reports the room's sync rate to the host after each beat of the song, as
-/// an unreliable datagram. Beats without any valid shake are skipped; the
-/// loop ends after the song's last beat or when the room is removed (via
-/// `cancellation`).
-async fn run_sync_rate_updates(
-    room_service: RoomService,
-    room_id: String,
-    cancellation: CancellationToken,
-) {
-    let Some(beat_times) = room_service.beat_schedule(&room_id) else {
-        debug!(
-            room_id = %room_id,
-            "room is not live, skipping sync-rate updates"
-        );
-        room_service.remove_sync_cancel_if_same(&room_id, &cancellation);
-        return;
-    };
-
-    if cancellation.is_cancelled() {
-        debug!(
-            room_id = %room_id,
-            "sync-rate updates cancelled before start"
-        );
-        room_service.remove_sync_cancel_if_same(&room_id, &cancellation);
-        return;
-    }
-
-    for beat_at in beat_times {
-        if cancellation.is_cancelled() {
-            debug!(
-                room_id = %room_id,
-                beat_at,
-                "sync-rate updates cancelled, stopping"
-            );
-            break;
-        }
-        if !room_service.exists(&room_id) {
-            debug!(
-                room_id = %room_id,
-                beat_at,
-                "room was removed, stopping sync-rate updates"
-            );
-            break;
-        }
-
-        // Wait until the beat's tolerance window has closed so that all
-        // shakes attributed to the beat (including late-arriving reports)
-        // are accounted for. The wait is cancelled as soon as the room is
-        // removed so the task does not linger through the song.
-        let report_at = beat_at.saturating_add(SYNC_REPORT_DELAY_US);
-        let now = unix_micros();
-        if report_at > now {
-            tokio::select! {
-                () = sleep(Duration::from_micros(report_at - now)) => {},
-                () = cancellation.cancelled() => {
-                    debug!(
-                        room_id = %room_id,
-                        beat_at,
-                        "sync-rate updates cancelled while waiting, stopping"
-                    );
-                    break;
-                }
-            }
-        }
-
-        if cancellation.is_cancelled() {
-            debug!(
-                room_id = %room_id,
-                beat_at,
-                "sync-rate updates cancelled, stopping"
-            );
-            break;
-        }
-        if !room_service.exists(&room_id) {
-            debug!(
-                room_id = %room_id,
-                beat_at,
-                "room was removed, stopping sync-rate updates"
-            );
-            break;
-        }
-
-        let Some(rate) = room_service.sync_rate(&room_id, beat_at) else {
-            // `None` means either "no valid shakes" or "room is gone";
-            // only the latter stops the loop.
-            if cancellation.is_cancelled() || !room_service.exists(&room_id) {
-                debug!(
-                    room_id = %room_id,
-                    beat_at,
-                    "room was removed, stopping sync-rate updates"
-                );
-                break;
-            }
-            debug!(
-                room_id = %room_id,
-                beat_at,
-                "no valid shakes for beat, skipping sync-rate report"
-            );
-            continue;
-        };
-
-        send_datagram_to_host(&room_service, &room_id, &ServerMessage::SyncRate { rate });
-    }
-
-    room_service.remove_sync_cancel_if_same(&room_id, &cancellation);
-    debug!(room_id = %room_id, "sync-rate updates stopped");
+    tracing::debug!(
+        room_id = %room_id,
+        participant_id = %participant_id,
+        "participant shook device, relaying to host"
+    );
+    // Fire-and-forget: the relay flow must not block on (or fail with) the
+    // host notification.
+    send_datagram_to_host(
+        room_service,
+        room_id,
+        &ServerMessage::ParticipantShake { participant_id },
+    );
 }
 
 /// Sends a server-initiated event to the room host as an unreliable
@@ -1047,23 +927,6 @@ mod tests {
             "title": "title"
         }))
         .expect("valid dummy song JSON")
-    }
-
-    fn song_with_beats(starts_at_ms: &[f32]) -> CompleteSongData {
-        serde_json::from_value(serde_json::json!({
-            "artist": "artist",
-            "durationMs": 10_000.0,
-            "beats": starts_at_ms
-                .iter()
-                .map(|&starts_at_ms| {
-                    serde_json::json!({"startsAtMs": starts_at_ms, "endsAtMs": starts_at_ms + 400.0})
-                })
-                .collect::<Vec<_>>(),
-            "phrases": [],
-            "segments": [{"isChorus": false, "startsAtMs": 0.0, "endsAtMs": 10_000.0}],
-            "title": "title"
-        }))
-        .expect("valid song JSON")
     }
 
     fn setup_room_service(room_id: &str) -> (RoomRepository, RoomService) {
@@ -1169,7 +1032,9 @@ mod tests {
             ServerMessage::LiveStarted { .. } => {
                 panic!("unexpected live started notification")
             }
-            ServerMessage::SyncRate { .. } => panic!("unexpected sync rate notification"),
+            ServerMessage::ParticipantShake { .. } => {
+                panic!("unexpected participant shake notification")
+            }
         }
     }
 
@@ -2218,10 +2083,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_webtransport_shake_reports_sync_rate_to_host() {
+    async fn test_webtransport_shake_relayed_to_host() {
         let room_id = "9797";
-        let (room_repo, room_service) =
-            setup_room_service_with_song(room_id, song_with_beats(&[0.0, 500.0]));
+        let (_room_repo, room_service) = setup_room_service(room_id);
 
         let (server_port, cert_hash) = start_server(room_service).await;
         let client = test_client(cert_hash);
@@ -2240,37 +2104,33 @@ mod tests {
             .expect("connect as participant");
         let participant_id = join_as_participant(&participant).await;
 
-        // The host announces the live start; the participant shakes exactly
-        // on beat 0.
-        let start_time = unix_micros() + 1_000_000;
-        let response = send_client_message(&host, &ClientMessage::LiveStart { start_time }).await;
-        assert!(response.is_empty());
-        send_datagram(
-            &participant,
-            &ClientMessage::Shake {
-                detected_at: start_time,
-            },
-        );
+        // Shake reports are relayed as-is without server-side aggregation.
+        send_datagram(&participant, &ClientMessage::Shake);
 
-        sleep(Duration::from_millis(100)).await;
-        assert_eq!(
-            room_repo.participant_shake_count(room_id, &participant_id),
-            Some(1)
-        );
-
-        // The beat-0 report arrives on the datagram channel once the beat's
-        // tolerance window has closed.
         let message = timeout(Duration::from_secs(5), recv_datagram(&host))
             .await
-            .expect("sync-rate report for beat 0");
+            .expect("shake relay for participant");
         assert!(
-            matches!(message, ServerMessage::SyncRate { rate: 100 }),
-            "a shake exactly on the beat must score 100, got {message:?}"
+            matches!(
+                message,
+                ServerMessage::ParticipantShake { participant_id: id } if id == participant_id
+            ),
+            "shake must be relayed with the participant id, got {message:?}"
         );
 
-        // Beat 1 (at start + 500 ms) has no shakes: no report is sent for it.
-        let result = timeout(Duration::from_millis(800), recv_datagram(&host)).await;
-        assert!(result.is_err(), "beats without shakes must not be reported");
+        // A shake reported on a stream is relayed the same way.
+        let response = send_client_message(&participant, &ClientMessage::Shake).await;
+        assert!(response.is_empty());
+        let message = timeout(Duration::from_secs(5), recv_datagram(&host))
+            .await
+            .expect("shake relay via stream");
+        assert!(
+            matches!(
+                message,
+                ServerMessage::ParticipantShake { participant_id: id } if id == participant_id
+            ),
+            "stream shake must be relayed with the participant id, got {message:?}"
+        );
 
         host.close(wtransport::VarInt::from_u32(0), b"done");
         participant.close(wtransport::VarInt::from_u32(0), b"done");
@@ -2279,8 +2139,7 @@ mod tests {
     #[tokio::test]
     async fn test_webtransport_host_shake_ignored() {
         let room_id = "9898";
-        let (room_repo, room_service) =
-            setup_room_service_with_song(room_id, song_with_beats(&[0.0, 500.0]));
+        let (_room_repo, room_service) = setup_room_service(room_id);
 
         let (server_port, cert_hash) = start_server(room_service).await;
         let client = test_client(cert_hash);
@@ -2299,41 +2158,24 @@ mod tests {
             .expect("connect as participant");
         let participant_id = join_as_participant(&participant).await;
 
-        let start_time = unix_micros() + 1_000_000;
-        let response = send_client_message(&host, &ClientMessage::LiveStart { start_time }).await;
-        assert!(response.is_empty());
-
-        // The participant shakes exactly on beat 0.
-        send_datagram(
-            &participant,
-            &ClientMessage::Shake {
-                detected_at: start_time,
-            },
-        );
-        sleep(Duration::from_millis(100)).await;
-        assert_eq!(
-            room_repo.participant_shake_count(room_id, &participant_id),
-            Some(1)
+        // The participant shake is relayed.
+        send_datagram(&participant, &ClientMessage::Shake);
+        let message = timeout(Duration::from_secs(5), recv_datagram(&host))
+            .await
+            .expect("shake relay for participant");
+        assert!(
+            matches!(
+                message,
+                ServerMessage::ParticipantShake { participant_id: id } if id == participant_id
+            ),
+            "shake must be relayed with the participant id, got {message:?}"
         );
 
         // A shake sent by the host is ignored.
-        send_datagram(
-            &host,
-            &ClientMessage::Shake {
-                detected_at: start_time,
-            },
-        );
+        send_datagram(&host, &ClientMessage::Shake);
 
-        // The beat-0 report arrives; beat 1 has no shakes and is skipped.
-        let message = timeout(Duration::from_secs(5), recv_datagram(&host))
-            .await
-            .expect("sync-rate report for beat 0");
-        assert!(
-            matches!(message, ServerMessage::SyncRate { rate: 100 }),
-            "a shake exactly on the beat must score 100, got {message:?}"
-        );
-        let result = timeout(Duration::from_millis(800), recv_datagram(&host)).await;
-        assert!(result.is_err(), "beats without shakes must not be reported");
+        let result = timeout(Duration::from_millis(500), recv_datagram(&host)).await;
+        assert!(result.is_err(), "host shakes must not be relayed");
 
         host.close(wtransport::VarInt::from_u32(0), b"done");
         participant.close(wtransport::VarInt::from_u32(0), b"done");
@@ -2500,10 +2342,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_webtransport_shake_before_live_not_recorded() {
+    async fn test_webtransport_shake_relayed_before_live() {
         let room_id = "9998";
-        let (_room_repo, room_service) =
-            setup_room_service_with_song(room_id, song_with_beats(&[0.0]));
+        let (_room_repo, room_service) = setup_room_service(room_id);
 
         let (server_port, cert_hash) = start_server(room_service).await;
         let client = test_client(cert_hash);
@@ -2520,142 +2361,25 @@ mod tests {
             .connect(format!("https://127.0.0.1:{server_port}/rooms/{room_id}"))
             .await
             .expect("connect as participant");
-        join_as_participant(&participant).await;
+        let participant_id = join_as_participant(&participant).await;
 
-        // A shake reported before the live starts is not recorded; it is
-        // 80 ms off the beat (a score of 20 if it were counted).
-        let start_time = unix_micros() + 1_000_000;
-        send_datagram(
-            &participant,
-            &ClientMessage::Shake {
-                detected_at: start_time + 80_000,
-            },
-        );
-        sleep(Duration::from_millis(200)).await;
-
-        // After the live starts, a shake exactly on beat 0 must be the only
-        // one counted: the rate is 100, not the average with the pre-live
-        // shake.
-        let response = send_client_message(&host, &ClientMessage::LiveStart { start_time }).await;
-        assert!(response.is_empty());
-        send_datagram(
-            &participant,
-            &ClientMessage::Shake {
-                detected_at: start_time,
-            },
-        );
+        // Shakes are relayed even before the live starts; the host decides
+        // how to handle them.
+        send_datagram(&participant, &ClientMessage::Shake);
 
         let message = timeout(Duration::from_secs(5), recv_datagram(&host))
             .await
-            .expect("sync-rate report for beat 0");
+            .expect("shake relay before live");
         assert!(
-            matches!(message, ServerMessage::SyncRate { rate: 100 }),
-            "the pre-live shake must not be averaged into the beat's rate, got {message:?}"
+            matches!(
+                message,
+                ServerMessage::ParticipantShake { participant_id: id } if id == participant_id
+            ),
+            "pre-live shake must be relayed, got {message:?}"
         );
 
         host.close(wtransport::VarInt::from_u32(0), b"done");
         participant.close(wtransport::VarInt::from_u32(0), b"done");
-    }
-
-    #[tokio::test]
-    async fn test_sync_rate_updates_stop_on_host_disconnect() {
-        let room_id = "9899";
-        // Beats far in the future: without cancellation the task would sleep
-        // for seconds after the room is removed.
-        let (room_repo, room_service) =
-            setup_room_service_with_song(room_id, song_with_beats(&[5000.0, 6000.0]));
-
-        let (server_port, cert_hash) = start_server(room_service).await;
-        let client = test_client(cert_hash);
-
-        let host = client
-            .connect(format!(
-                "https://127.0.0.1:{server_port}/rooms/{room_id}?hostToken={HOST_TOKEN}"
-            ))
-            .await
-            .expect("connect as host");
-        sleep(Duration::from_millis(200)).await;
-
-        let start_time = unix_micros() + 1_000_000;
-        let response = send_client_message(&host, &ClientMessage::LiveStart { start_time }).await;
-        assert!(response.is_empty());
-
-        // Wait for the spawned sync-rate task to register its token.
-        let token = timeout(Duration::from_secs(5), async {
-            loop {
-                if let Some(token) = room_repo.sync_cancel_token(room_id) {
-                    return token;
-                }
-                sleep(Duration::from_millis(10)).await;
-            }
-        })
-        .await
-        .expect("sync-rate token registered");
-        assert!(!token.is_cancelled());
-
-        host.close(wtransport::VarInt::from_u32(0), b"done");
-
-        // The server notices the close, removes the room and cancels the token.
-        timeout(Duration::from_secs(5), async {
-            loop {
-                if !room_repo.exists(room_id) {
-                    return;
-                }
-                sleep(Duration::from_millis(10)).await;
-            }
-        })
-        .await
-        .expect("room removed after host disconnect");
-        assert!(
-            token.is_cancelled(),
-            "remove_room must cancel the sync-rate task"
-        );
-        assert!(
-            !room_repo.has_sync_cancel(room_id),
-            "cancelled task must not leave a stale token"
-        );
-    }
-
-    #[tokio::test]
-    async fn test_run_sync_rate_updates_exits_promptly_on_cancel() {
-        let room_id = "9900";
-        let (room_repo, room_service) =
-            setup_room_service_with_song(room_id, song_with_beats(&[5000.0, 6000.0]));
-
-        let (server_port, cert_hash) = start_server(room_service.clone()).await;
-        let client = test_client(cert_hash);
-
-        let host = client
-            .connect(format!(
-                "https://127.0.0.1:{server_port}/rooms/{room_id}?hostToken={HOST_TOKEN}"
-            ))
-            .await
-            .expect("connect as host");
-        sleep(Duration::from_millis(200)).await;
-
-        let start_time = unix_micros() + 1_000_000;
-        let response = send_client_message(&host, &ClientMessage::LiveStart { start_time }).await;
-        assert!(response.is_empty());
-        sleep(Duration::from_millis(200)).await;
-
-        // Spawn an extra waiter on far-future beats and cancel it: it must
-        // return well before the first beat instead of sleeping through it.
-        let extra = CancellationToken::new();
-        let handle = tokio::spawn(run_sync_rate_updates(
-            room_service.clone(),
-            room_id.to_string(),
-            extra.clone(),
-        ));
-        sleep(Duration::from_millis(100)).await;
-        extra.cancel();
-        timeout(Duration::from_secs(2), handle)
-            .await
-            .expect("cancelled sync-rate task must finish promptly")
-            .expect("task must not panic");
-
-        // The live's own task is still registered; clean up via disconnect.
-        assert!(room_repo.has_sync_cancel(room_id));
-        host.close(wtransport::VarInt::from_u32(0), b"done");
     }
 
     async fn wait_until_room_gone(room_repo: &RoomRepository, room_id: &str) {

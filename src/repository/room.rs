@@ -5,14 +5,11 @@ use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 use crate::domain::model::CompleteSongData;
-use crate::domain::room::{Host, Participant, Room, ShakeOutcome};
+use crate::domain::room::{Host, Participant, Room};
 
 #[derive(Clone, Default)]
 pub struct RoomRepository {
     inner: Arc<RwLock<HashMap<String, Room>>>,
-    /// Cancellation tokens for per-room `run_sync_rate_updates` tasks.
-    /// Kept outside `Room` so the domain layer stays free of tokio types.
-    sync_cancels: Arc<RwLock<HashMap<String, CancellationToken>>>,
     /// Cancellation tokens for per-room host grace-period timers.
     /// `(disconnected host id, token)` is stored so a stale timer cannot
     /// remove a reconnected or recreated room.
@@ -23,7 +20,6 @@ impl RoomRepository {
     pub fn new() -> Self {
         Self {
             inner: Arc::new(RwLock::new(HashMap::new())),
-            sync_cancels: Arc::new(RwLock::new(HashMap::new())),
             host_grace_cancels: Arc::new(RwLock::new(HashMap::new())),
         }
     }
@@ -263,42 +259,10 @@ impl RoomRepository {
     }
 
     /// Removes and returns the room. Returns `None` if the room does not exist.
-    /// Any sync-rate update task is cancelled first so it does not linger.
     /// Any pending host grace timer entry is dropped as well.
     pub fn remove_room(&self, room_id: &str) -> Option<Room> {
-        self.cancel_sync_updates(room_id);
         self.host_grace_cancels.write().remove(room_id);
         self.inner.write().remove(room_id)
-    }
-
-    /// Registers the cancellation token for the room's sync-rate update task.
-    ///
-    /// If the room is already gone (e.g. the host disconnected concurrently
-    /// with `LiveStart`), the token is cancelled immediately instead of being
-    /// stored so the spawned task exits without sleeping through the song.
-    pub fn set_sync_cancel(&self, room_id: String, token: CancellationToken) {
-        if !self.inner.read().contains_key(&room_id) {
-            token.cancel();
-            return;
-        }
-        self.sync_cancels.write().insert(room_id, token);
-    }
-
-    /// Cancels and drops the room's sync-rate update task, if any.
-    pub fn cancel_sync_updates(&self, room_id: &str) {
-        if let Some(token) = self.sync_cancels.write().remove(room_id) {
-            token.cancel();
-        }
-    }
-
-    /// Drops the stored token only if it is the same cancellation graph as
-    /// `token`. Prevents a finished task from deleting a recreated room's
-    /// (same id) token.
-    pub fn remove_sync_cancel_if_same(&self, room_id: &str, token: &CancellationToken) {
-        let mut cancels = self.sync_cancels.write();
-        if cancels.get(room_id).is_some_and(|stored| stored == token) {
-            cancels.remove(room_id);
-        }
     }
 
     /// Transitions the room to live with the given start time (unix
@@ -324,47 +288,6 @@ impl RoomRepository {
                 Err(StartLiveError::AlreadyLive)
             }
             None => Err(StartLiveError::RoomNotFound),
-        }
-    }
-
-    /// Records one participant device-shake report.
-    pub fn record_shake(
-        &self,
-        room_id: &str,
-        participant_id: Uuid,
-        detected_at: u64,
-    ) -> Result<(), ShakeError> {
-        let mut map = self.inner.write();
-        match map.get_mut(room_id) {
-            Some(room) => {
-                let live = room.live_mut().ok_or(ShakeError::NotLive)?;
-                match live.record_shake(participant_id, detected_at) {
-                    ShakeOutcome::Recorded => Ok(()),
-                    ShakeOutcome::UnknownParticipant => Err(ShakeError::ParticipantNotFound),
-                }
-            }
-            None => Err(ShakeError::RoomNotFound),
-        }
-    }
-
-    /// The room's overall sync rate (0-100) of the device shakes attributed
-    /// to the beat starting at `beat_at`, or `None` if no valid shake falls
-    /// within the beat's tolerance window. `None` is also returned when the
-    /// room does not exist or its live has not started.
-    pub fn sync_rate(&self, room_id: &str, beat_at: u64) -> Option<u8> {
-        match self.inner.read().get(room_id) {
-            Some(Room::Live(live)) => live.sync_rate(beat_at),
-            _ => None,
-        }
-    }
-
-    /// Absolute start times (unix microseconds) of the live's beats, used to
-    /// schedule per-beat sync-rate reports. `None` if the room does not exist
-    /// or its live has not started.
-    pub fn beat_schedule(&self, room_id: &str) -> Option<Vec<u64>> {
-        match self.inner.read().get(room_id) {
-            Some(Room::Live(live)) => Some(live.beat_schedule()),
-            _ => None,
         }
     }
 
@@ -405,90 +328,13 @@ impl RoomRepository {
     }
 
     #[cfg(test)]
-    pub fn participant_shake_count(&self, room_id: &str, participant_id: &Uuid) -> Option<usize> {
-        match self.inner.read().get(room_id) {
-            Some(Room::Live(live)) => live.shake_count(participant_id),
-            _ => None,
-        }
-    }
-
-    #[cfg(test)]
-    pub fn has_sync_cancel(&self, room_id: &str) -> bool {
-        self.sync_cancels.read().contains_key(room_id)
-    }
-
-    #[cfg(test)]
-    pub fn sync_cancel_token(&self, room_id: &str) -> Option<CancellationToken> {
-        self.sync_cancels.read().get(room_id).cloned()
-    }
-
-    #[cfg(test)]
     pub fn has_host_grace(&self, room_id: &str) -> bool {
         self.host_grace_cancels.read().contains_key(room_id)
     }
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::domain::room::WaitingRoom;
-
-    fn waiting_room() -> Room {
-        let song = serde_json::from_value(serde_json::json!({
-            "artist": "artist",
-            "durationMs": 1000.0,
-            "beats": [{"startsAtMs": 0.0, "endsAtMs": 500.0}],
-            "phrases": [],
-            "segments": [{"isChorus": false, "startsAtMs": 0.0, "endsAtMs": 1000.0}],
-            "title": "title"
-        }))
-        .expect("valid dummy song JSON");
-        Room::Waiting(WaitingRoom::new(song, "token".to_string()))
-    }
-
-    #[test]
-    fn set_sync_cancel_on_missing_room_cancels_immediately() {
-        let repo = RoomRepository::new();
-        let token = CancellationToken::new();
-        repo.set_sync_cancel("0000".to_string(), token.clone());
-        assert!(token.is_cancelled());
-        assert!(!repo.has_sync_cancel("0000"));
-    }
-
-    #[test]
-    fn remove_room_cancels_sync_task() {
-        let repo = RoomRepository::new();
-        repo.insert("0001".to_string(), waiting_room());
-        let token = CancellationToken::new();
-        repo.set_sync_cancel("0001".to_string(), token.clone());
-        assert!(repo.has_sync_cancel("0001"));
-        assert!(!token.is_cancelled());
-
-        let _ = repo.remove_room("0001");
-        assert!(token.is_cancelled());
-        assert!(!repo.has_sync_cancel("0001"));
-    }
-
-    #[test]
-    fn remove_sync_cancel_if_same_keeps_recreated_room_token() {
-        let repo = RoomRepository::new();
-        repo.insert("0002".to_string(), waiting_room());
-        let old = CancellationToken::new();
-        repo.set_sync_cancel("0002".to_string(), old.clone());
-
-        // Room id is reused for a new live: the new task overwrites the token.
-        let new = CancellationToken::new();
-        repo.set_sync_cancel("0002".to_string(), new.clone());
-
-        // The finished old task must not delete the new room's token.
-        repo.remove_sync_cancel_if_same("0002", &old);
-        assert!(repo.has_sync_cancel("0002"));
-        assert_eq!(repo.sync_cancel_token("0002"), Some(new.clone()));
-
-        repo.remove_sync_cancel_if_same("0002", &new);
-        assert!(!repo.has_sync_cancel("0002"));
-    }
-}
+mod tests {}
 
 #[derive(Debug, thiserror::Error)]
 pub enum InsertParticipantError {
@@ -528,14 +374,4 @@ pub enum StartLiveError {
     HostNotJoined,
     #[error("live has already started")]
     AlreadyLive,
-}
-
-#[derive(Debug, thiserror::Error)]
-pub enum ShakeError {
-    #[error("room not found")]
-    RoomNotFound,
-    #[error("live has not started")]
-    NotLive,
-    #[error("participant not found")]
-    ParticipantNotFound,
 }

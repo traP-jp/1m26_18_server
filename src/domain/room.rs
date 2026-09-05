@@ -6,20 +6,10 @@ use uuid::Uuid;
 
 use crate::domain::model::CompleteSongData;
 
-/// Tolerance for beat-sync scoring: a device shake exactly on the beat
-/// scores 100, one at (or beyond) this distance scores zero,
-/// and the score decays linearly in between.
-pub const SYNC_TOLERANCE_US: i64 = 100_000;
-
-/// Delay from a beat's start time until the beat's sync-rate report is sent
-/// to the host, so that shakes within the beat's tolerance window (including
-/// late-arriving reports) have time to arrive.
-pub const SYNC_REPORT_DELAY_US: u64 = 200_000;
-
 /// Grace period after the host disconnects before the room is removed.
 ///
 /// If a host with the same token reconnects within this period, the room
-/// (participants, readiness, live state, shakes) is restored. Otherwise the
+/// (participants, readiness and live state) is restored. Otherwise the
 /// room is removed and remaining participant connections are closed.
 pub const HOST_GRACE_PERIOD: Duration = Duration::from_secs(20);
 
@@ -61,13 +51,6 @@ impl Room {
         match self {
             Room::Waiting(_) | Room::Live(_) => None,
             Room::HostJoined(joined) => Some(joined.as_mut()),
-        }
-    }
-
-    pub(crate) fn live_mut(&mut self) -> Option<&mut LiveRoom> {
-        match self {
-            Room::Waiting(_) | Room::HostJoined(_) => None,
-            Room::Live(live) => Some(live.as_mut()),
         }
     }
 
@@ -252,7 +235,6 @@ impl HostJoinedRoom {
             host_token: self.host_token,
             song: self.song,
             participants: self.participants,
-            shakes: HashMap::new(),
             start_time,
         }
     }
@@ -265,8 +247,6 @@ pub struct LiveRoom {
     host_token: String,
     song: CompleteSongData,
     participants: HashMap<Uuid, Participant>,
-    /// Reported device-shake times (unix microseconds), per participant.
-    shakes: HashMap<Uuid, Vec<u64>>,
     /// Start time of the live (unix microseconds), announced by the host.
     start_time: u64,
 }
@@ -302,99 +282,6 @@ impl LiveRoom {
     pub fn start_time(&self) -> u64 {
         self.start_time
     }
-
-    /// Records a device-shake report.
-    pub(crate) fn record_shake(&mut self, participant_id: Uuid, detected_at: u64) -> ShakeOutcome {
-        if !self.participants.contains_key(&participant_id) {
-            return ShakeOutcome::UnknownParticipant;
-        }
-        self.shakes
-            .entry(participant_id)
-            .or_default()
-            .push(detected_at);
-        ShakeOutcome::Recorded
-    }
-
-    /// The overall sync rate (0-100) of the device shakes attributed to the
-    /// beat starting at `beat_at` (unix microseconds), or `None` if no valid
-    /// shake falls within the beat's tolerance window.
-    pub(crate) fn sync_rate(&self, beat_at: u64) -> Option<u8> {
-        beat_sync_rate(self.participants.keys(), &self.shakes, beat_at)
-    }
-
-    /// Absolute start times (unix microseconds) of the song's beats, as seen
-    /// from this live's start time; used to schedule per-beat sync-rate
-    /// reports.
-    pub(crate) fn beat_schedule(&self) -> Vec<u64> {
-        self.song
-            .beats()
-            .iter()
-            .map(|beat| beat_start_time(self.start_time, beat.starts_at_ms()))
-            .collect()
-    }
-
-    #[cfg(test)]
-    pub(crate) fn shake_count(&self, participant_id: &Uuid) -> Option<usize> {
-        self.shakes.get(participant_id).map(Vec::len)
-    }
-}
-
-/// Result of recording a participant device shake.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ShakeOutcome {
-    /// The report was recorded and will be considered in sync calculations.
-    Recorded,
-    /// The participant is not in the room (e.g. it has disconnected).
-    UnknownParticipant,
-}
-
-/// Saturating conversion of a unix-microseconds timestamp to `i64`.
-///
-/// Absolute times fit `i64` until the year ~294247, so this never saturates in practice.
-fn timestamp_to_i64(us: u64) -> i64 {
-    i64::try_from(us).unwrap_or(i64::MAX)
-}
-
-/// Computes the overall sync rate (0-100) of the device shakes attributed to
-/// the beat starting at `beat_at` (unix microseconds).
-///
-/// Only shakes of the given participants are considered; shakes of
-/// disconnected participants (not listed) are excluded. Each shake time
-/// is scored by its distance to the beat time: exactly on the beat scores
-/// 100, at (or beyond) [`SYNC_TOLERANCE_US`] scores zero, decaying linearly
-/// in between. Returns `None` when no valid shake falls within the beat's
-/// tolerance window.
-fn beat_sync_rate<'a>(
-    participants: impl IntoIterator<Item = &'a Uuid>,
-    shakes: &HashMap<Uuid, Vec<u64>>,
-    beat_at: u64,
-) -> Option<u8> {
-    let mut total = 0.0;
-    let mut count = 0usize;
-    for participant_id in participants {
-        let Some(times) = shakes.get(participant_id) else {
-            continue;
-        };
-        for &detected_at in times {
-            let deviation = (timestamp_to_i64(detected_at) - timestamp_to_i64(beat_at)).abs();
-            if deviation > SYNC_TOLERANCE_US {
-                continue;
-            }
-            total += 100.0 * (1.0 - deviation as f64 / SYNC_TOLERANCE_US as f64);
-            count += 1;
-        }
-    }
-    if count == 0 {
-        return None;
-    }
-    Some((total / count as f64).round().clamp(0.0, 100.0) as u8)
-}
-
-/// Absolute start time (unix microseconds) of the beat at `starts_at_ms` into
-/// the song, as seen from a live that started at `start_time`. Negative
-/// offsets (malformed data) clamp to the live start.
-fn beat_start_time(start_time: u64, starts_at_ms: f32) -> u64 {
-    start_time.saturating_add((starts_at_ms.max(0.0) * 1000.0) as u64)
 }
 
 #[derive(Deserialize, Serialize, ToSchema)]
@@ -449,12 +336,10 @@ pub enum ClientMessage {
     LiveStart {
         start_time: u64,
     },
-    /// Participant: reports the absolute time (unix microseconds) at which
-    /// its device was shaken. Sent unreliably as a WebTransport datagram;
-    /// the server uses the report to compute the room's per-beat sync rate.
-    Shake {
-        detected_at: u64,
-    },
+    /// Participant: reports that its device was shaken. Sent unreliably as a
+    /// WebTransport datagram; the server relays it to the host as-is without
+    /// aggregation. The host uses the receipt time for scoring.
+    Shake,
 }
 
 /// Message sent from the server to the client over WebTransport.
@@ -509,67 +394,13 @@ pub enum ServerMessage {
     LiveStarted {
         start_time: u64,
     },
-    /// Host only: the overall sync rate (0-100) of the device shakes
-    /// attributed to one beat of the song. Sent unreliably as a WebTransport
-    /// datagram, once per beat; beats without any valid shake are skipped.
-    SyncRate {
-        rate: u8,
+    /// Host only: a participant shook its device. Relayed as-is; the server
+    /// does not aggregate shakes. Sent unreliably as a WebTransport datagram,
+    /// once per shake report.
+    ParticipantShake {
+        participant_id: Uuid,
     },
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn beat_sync_rate_scores_distance_to_beat() {
-        let participant = Uuid::now_v7();
-        let beat_at = 1_000_000_000_000_000;
-
-        // Exactly on the beat scores 100.
-        let shakes = HashMap::from([(participant, vec![beat_at])]);
-        assert_eq!(beat_sync_rate([&participant], &shakes, beat_at), Some(100));
-
-        // Half the tolerance away scores 50.
-        let shakes = HashMap::from([(participant, vec![beat_at + 50_000])]);
-        assert_eq!(beat_sync_rate([&participant], &shakes, beat_at), Some(50));
-
-        // Beyond the tolerance the shake is not attributed to the beat at all.
-        let shakes = HashMap::from([(participant, vec![beat_at + 150_000])]);
-        assert_eq!(beat_sync_rate([&participant], &shakes, beat_at), None);
-    }
-
-    #[test]
-    fn beat_sync_rate_averages_shake_scores() {
-        let participant = Uuid::now_v7();
-        let beat_at = 1_000_000_000_000_000;
-
-        // Scores 100 (on the beat) and 40 (60 ms away) average to 70.
-        let shakes = HashMap::from([(participant, vec![beat_at, beat_at + 60_000])]);
-        assert_eq!(beat_sync_rate([&participant], &shakes, beat_at), Some(70));
-    }
-
-    #[test]
-    fn beat_sync_rate_excludes_absent_participants() {
-        let present = Uuid::now_v7();
-        let absent = Uuid::now_v7();
-        let missing = Uuid::now_v7();
-        let beat_at = 1_000_000_000_000_000;
-        let shakes = HashMap::from([(present, vec![beat_at]), (absent, vec![beat_at + 60_000])]);
-
-        // Only listed participants are considered; the unlisted shake (which
-        // would score 40) does not drag the average down from 100.
-        assert_eq!(beat_sync_rate([&present], &shakes, beat_at), Some(100));
-        // A listed participant without shakes yields no rate.
-        assert_eq!(beat_sync_rate([&missing], &shakes, beat_at), None);
-    }
-
-    #[test]
-    fn beat_start_time_is_live_start_plus_song_offset() {
-        let start_time = 1_000_000_000_000_000;
-        assert_eq!(beat_start_time(start_time, 0.0), start_time);
-        assert_eq!(beat_start_time(start_time, 500.0), start_time + 500_000);
-        // Negative offsets (malformed data) clamp to the live start.
-        assert_eq!(beat_start_time(start_time, -1.0), start_time);
-    }
-}
+mod tests {}
