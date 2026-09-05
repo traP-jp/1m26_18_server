@@ -95,7 +95,12 @@ impl WebTransportServer {
         heartbeat_timeout: Duration,
         host_grace_period: Duration,
     ) -> Result<(Self, Sha256Digest), WebTransportError> {
-        let identity = Identity::self_signed(["localhost", "127.0.0.1"])?;
+        let identity = Identity::self_signed([
+            "localhost",
+            "127.0.0.1",
+            "syncalive.trap.show",
+            "syncalive-viewer.trap.show",
+        ])?;
 
         let hash = identity.certificate_chain().as_slice()[0].hash();
         info!(port, hash = %hash, "WebTransport identity generated (use serverCertificateHashes for browser)");
