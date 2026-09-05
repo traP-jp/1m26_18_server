@@ -5,6 +5,8 @@ pub mod webtransport;
 use std::io::Result;
 
 use axum::Router;
+#[cfg(not(debug_assertions))]
+use http::{HeaderValue, Method, header};
 use tokio::net::TcpListener;
 use tower_http::cors::CorsLayer;
 use tower_http::trace::TraceLayer;
@@ -27,6 +29,25 @@ pub struct AppState {
 }
 
 const API_ROOT: &str = "/api/v1";
+
+/// dev ビルドではワイルドカード許可、本番ビルドでは指定オリジンのみ許可する。
+#[cfg(debug_assertions)]
+fn cors_layer() -> CorsLayer {
+    CorsLayer::permissive()
+}
+
+/// 本番ビルド用: Safari でワイルドカードがブロックされるため明示的な許可リストを使う。
+/// 使用メソッドは GET/POST、使用ヘッダーは Content-Type のみに絞っている。
+#[cfg(not(debug_assertions))]
+fn cors_layer() -> CorsLayer {
+    CorsLayer::new()
+        .allow_origin([
+            HeaderValue::from_static("https://syncalive.trap.show"),
+            HeaderValue::from_static("https://syncalive-viewer.trap.show"),
+        ])
+        .allow_methods([Method::GET, Method::POST])
+        .allow_headers([header::CONTENT_TYPE])
+}
 
 pub fn setup_openapi_routes() -> (Router<AppState>, OpenApi) {
     let openapi = OpenApiBuilder::new()
@@ -58,7 +79,7 @@ pub async fn serve(state: AppState) -> Result<()> {
     let router = Router::new()
         .nest(API_ROOT, router)
         .merge(SwaggerUi::new("/docs/swagger-ui").url("/docs/openapi.json", openapi))
-        .layer(CorsLayer::permissive())
+        .layer(cors_layer())
         .layer(TraceLayer::new_for_http())
         .with_state(state);
     let listener = TcpListener::bind("0.0.0.0:8080").await?;
